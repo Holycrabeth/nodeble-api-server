@@ -1,0 +1,19 @@
+# NODEBLE API server config
+# Installed to ~/.nodeble-api/config/api.yaml by deploy/deploy.sh on first run.
+# Tokens and TLS paths are populated by CLI commands (see README).
+
+server:
+  host: "0.0.0.0"
+  port: 8765
+
+# Populated by: python -m nodeble_api_server generate-token <label>
+# Each entry is {token: "<uuid>", label: "<human-readable>"}.
+auth:
+  valid_tokens: []
+
+# Populated by: python -m nodeble_api_server generate-cert
+# Server starts over HTTPS iff both cert_path and key_path point to existing files.
+tls:
+  cert_path: ""
+  key_path: ""
+  fingerprint: ""

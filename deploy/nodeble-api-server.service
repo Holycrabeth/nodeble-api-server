@@ -1,0 +1,16 @@
+# Installed by deploy.sh — placeholders are replaced at install time
+[Unit]
+Description=NODEBLE API Server
+After=network.target
+
+[Service]
+Type=simple
+User=NODEBLE_API_USER
+ExecStart=NODEBLE_API_VENV/bin/python -m nodeble_api_server
+WorkingDirectory=NODEBLE_API_DIR
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
