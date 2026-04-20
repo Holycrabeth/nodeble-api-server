@@ -12,15 +12,22 @@ import uvicorn
 
 from nodeble_api_server import cli
 from nodeble_api_server.config import load_config
+from nodeble_api_server.logging_setup import install_token_redaction
 
 
 def _run_server() -> None:
+    # Install BEFORE uvicorn.run so uvicorn's own logger inherits the
+    # sanitizing LogRecord factory set on the logging module root.
+    install_token_redaction()
+
     cfg = load_config()
     kwargs: dict = {
         "host": cfg.server.host,
         "port": cfg.server.port,
-        # access_log=False: default uvicorn format logs the full URL including
-        # `?token=...`, which leaks tokens to stdout / any redirected log.
+        # access_log=False disables `uvicorn.access` (HTTP request log).
+        # WebSocket handshake lines emit through `uvicorn.error` at INFO
+        # and WOULD leak `?token=` — logging_setup.install_token_redaction
+        # (above) catches those globally.
         "access_log": False,
         # WS keepalive: Mac lid-close + wake is a common scenario where TCP
         # won't notice the broken socket for minutes. Ping every 20s with a
