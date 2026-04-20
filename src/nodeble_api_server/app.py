@@ -36,3 +36,8 @@ def server_info() -> dict:
 
 
 app.include_router(api_v1)
+
+# Strategy-scoped routes live in their own module for clarity.
+from nodeble_api_server.routes import strategies as _strategies  # noqa: E402
+
+app.include_router(_strategies.router)

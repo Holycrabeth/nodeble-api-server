@@ -1,0 +1,283 @@
+"""File system reader for the 9 strategy modules' state/config/allocation.
+
+Pattern per module: ~/.<folder>/data/state.json + config/{strategy,risk}.yaml +
+data/signal_state.json. Allocation is centralized at
+~/.nodeble-orchestrator/data/allocation.json.
+
+All reads are cached 5 seconds to make /api/v1/strategies (9-strategy fan-out)
+cheap. Writes invalidate nothing (read-only module); TTL covers cron updates.
+
+Timestamp formats across strategies are inconsistent (date-only / ISO with or
+without tz / empty string). `normalize_timestamp` funnels everything into
+ISO 8601 + America/New_York.
+"""
+from __future__ import annotations
+
+import json
+import time
+from datetime import date, datetime, time as time_cls, timezone
+from pathlib import Path
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
+
+import yaml
+
+SERVER_TZ = ZoneInfo("America/New_York")
+
+STRATEGY_REGISTRY: dict[str, dict[str, str]] = {
+    "ic":                {"name": "Iron Condor",    "folder": ".nodeble"},
+    "wheel":             {"name": "Wheel",          "folder": ".nodeble-wheel"},
+    "pmcc":              {"name": "PMCC",           "folder": ".nodeble-pmcc"},
+    "calendar":          {"name": "Calendar",       "folder": ".nodeble-calendar"},
+    "collar":            {"name": "Collar",         "folder": ".nodeble-collar"},
+    "directionalspread": {"name": "Credit Spread",  "folder": ".nodeble-directionalspread", "allocation_key": "cs"},
+    "ironbutterfly":     {"name": "Iron Butterfly", "folder": ".nodeble-ironbutterfly"},
+    "straddle":          {"name": "Straddle",       "folder": ".nodeble-straddle"},
+    "strangle":          {"name": "Strangle",       "folder": ".nodeble-strangle"},
+}
+
+ACTIVE_POSITION_STATUSES: frozenset[str] = frozenset({"open", "pending", "partial", "assigned"})
+
+_CACHE_TTL = 5.0
+_cache: dict[tuple, tuple[Any, float]] = {}
+
+
+# ── Cache ───────────────────────────────────────────────────────────────────
+
+def _cached(key: tuple, loader: Callable[[], Any]) -> Any:
+    now = time.monotonic()
+    entry = _cache.get(key)
+    if entry is not None and now - entry[1] < _CACHE_TTL:
+        return entry[0]
+    value = loader()
+    _cache[key] = (value, now)
+    return value
+
+
+def clear_cache() -> None:
+    """Test helper — drop all cached reads."""
+    _cache.clear()
+
+
+# ── Safe file readers ──────────────────────────────────────────────────────
+
+def _read_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+
+
+def _read_yaml(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text())
+        return data if isinstance(data, dict) else None
+    except (yaml.YAMLError, OSError):
+        return None
+
+
+# ── Timestamp normalization ─────────────────────────────────────────────────
+
+def normalize_timestamp(raw: Any) -> str | None:
+    """Normalize a state.json timestamp to ISO 8601 + America/New_York.
+
+    Accepted inputs:
+    - ISO datetime with tz       → pass through (stays as-is)
+    - ISO datetime without tz    → localize to ET
+    - Date-only "YYYY-MM-DD"     → treat as 00:00 ET that day
+    - None / non-string / empty  → None
+    - Malformed                  → None
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+
+    # ISO datetime (with or without tz)
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=SERVER_TZ)
+        return dt.isoformat()
+    except ValueError:
+        pass
+
+    # Date-only
+    try:
+        d = date.fromisoformat(s)
+        dt = datetime.combine(d, time_cls.min).replace(tzinfo=SERVER_TZ)
+        return dt.isoformat()
+    except ValueError:
+        pass
+
+    return None
+
+
+def _from_ts_epoch(epoch_seconds: float) -> str:
+    return datetime.fromtimestamp(epoch_seconds, tz=SERVER_TZ).isoformat()
+
+
+# ── Public readers ──────────────────────────────────────────────────────────
+
+def list_installed_strategies(home: Path | None = None) -> list[str]:
+    home = home or Path.home()
+    return [
+        sid
+        for sid, meta in STRATEGY_REGISTRY.items()
+        if (home / meta["folder"] / "data" / "state.json").exists()
+    ]
+
+
+def read_state(strategy_id: str, home: Path | None = None) -> dict | None:
+    home = home or Path.home()
+    meta = STRATEGY_REGISTRY.get(strategy_id)
+    if not meta:
+        return None
+    path = home / meta["folder"] / "data" / "state.json"
+    return _cached(("state", strategy_id, str(path)), lambda: _read_json(path))
+
+
+def read_config(strategy_id: str, home: Path | None = None) -> dict | None:
+    """Merge strategy.yaml + risk.yaml. strategy.yaml missing → None."""
+    home = home or Path.home()
+    meta = STRATEGY_REGISTRY.get(strategy_id)
+    if not meta:
+        return None
+    strat_path = home / meta["folder"] / "config" / "strategy.yaml"
+    risk_path = home / meta["folder"] / "config" / "risk.yaml"
+
+    def loader() -> dict | None:
+        strat = _read_yaml(strat_path)
+        if strat is None:
+            return None
+        risk = _read_yaml(risk_path)
+        merged = dict(strat)
+        if risk:
+            # risk.yaml top-level is "risk:" already, merge as-is
+            for k, v in risk.items():
+                merged[k] = v
+        return merged
+
+    return _cached(("config", strategy_id, str(strat_path)), loader)
+
+
+def read_signal_timestamp(strategy_id: str, home: Path | None = None) -> str | None:
+    """Read signal_state.json and return its generated_at field (normalized)."""
+    home = home or Path.home()
+    meta = STRATEGY_REGISTRY.get(strategy_id)
+    if not meta:
+        return None
+    path = home / meta["folder"] / "data" / "signal_state.json"
+    data = _cached(("signal", strategy_id, str(path)), lambda: _read_json(path))
+    if not data:
+        return None
+    return normalize_timestamp(data.get("generated_at"))
+
+
+def read_allocation(home: Path | None = None) -> dict | None:
+    home = home or Path.home()
+    path = home / ".nodeble-orchestrator" / "data" / "allocation.json"
+    return _cached(("allocation", str(path)), lambda: _read_json(path))
+
+
+def latest_log_mtime(strategy_id: str, home: Path | None = None) -> str | None:
+    """Return the newest *.log mtime under ~/<folder>/logs/, ISO + ET. None if no logs."""
+    home = home or Path.home()
+    meta = STRATEGY_REGISTRY.get(strategy_id)
+    if not meta:
+        return None
+    logs_dir = home / meta["folder"] / "logs"
+    if not logs_dir.exists():
+        return None
+    latest: float | None = None
+    for log in logs_dir.glob("*.log"):
+        try:
+            mtime = log.stat().st_mtime
+        except OSError:
+            continue
+        if latest is None or mtime > latest:
+            latest = mtime
+    if latest is None:
+        return None
+    return _from_ts_epoch(latest)
+
+
+# ── Position helpers ────────────────────────────────────────────────────────
+
+def positions_as_list(positions_raw: Any) -> list[dict]:
+    """Normalize positions to list[dict] regardless of source shape (dict or list)."""
+    if isinstance(positions_raw, dict):
+        out = []
+        for spread_id, pos in positions_raw.items():
+            if isinstance(pos, dict):
+                pos = {**pos}  # copy
+                pos.setdefault("spread_id", spread_id)
+                out.append(pos)
+        return out
+    if isinstance(positions_raw, list):
+        return [p for p in positions_raw if isinstance(p, dict)]
+    return []
+
+
+def count_active_positions(positions_raw: Any) -> int:
+    return sum(
+        1
+        for p in positions_as_list(positions_raw)
+        if p.get("status") in ACTIVE_POSITION_STATUSES
+    )
+
+
+def sum_active_budget(positions_raw: Any) -> float:
+    """Σ max_risk × contracts × 100 over active positions (same formula bot_helpers uses)."""
+    total = 0.0
+    for p in positions_as_list(positions_raw):
+        if p.get("status") not in ACTIVE_POSITION_STATUSES:
+            continue
+        max_risk = p.get("max_risk") or 0
+        contracts = p.get("contracts") or 1
+        try:
+            total += float(max_risk) * float(contracts) * 100
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+# ── Health ──────────────────────────────────────────────────────────────────
+
+def compute_health(
+    last_scan_at: str | None,
+    last_manage_at: str | None,
+    last_signal_at: str | None,
+    now: datetime | None = None,
+) -> str:
+    """Health tier:
+    - critical: last_scan_at or last_manage_at missing/unparseable
+    - warning:  any of the three is > 24h old
+    - healthy:  otherwise
+    """
+    if not last_scan_at or not last_manage_at:
+        return "critical"
+    if now is None:
+        now = datetime.now(SERVER_TZ)
+    threshold_sec = 24 * 3600
+    for ts in (last_scan_at, last_manage_at, last_signal_at):
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=SERVER_TZ)
+        age = (now - dt).total_seconds()
+        if age > threshold_sec:
+            return "warning"
+    # Scan/manage both present but parse failed → degrade to warning (conservative)
+    if not last_scan_at or not last_manage_at:
+        return "critical"
+    return "healthy"
