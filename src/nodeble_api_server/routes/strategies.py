@@ -48,18 +48,20 @@ def _build_card(strategy_id: str) -> dict:
         or 0
     )
 
-    last_scan_at = normalize_timestamp(state.get("last_scan_date"))
-    last_manage_at = normalize_timestamp(state.get("last_manage_date"))
-    last_signal_at = read_signal_timestamp(strategy_id)
+    # Health is computed from state.json / signal_state.json ONLY.
+    # log mtime is display-only fallback so stale strategies don't masquerade as healthy
+    # just because their log file was touched (e.g. by logrotate or a tail).
+    state_scan = normalize_timestamp(state.get("last_scan_date"))
+    state_manage = normalize_timestamp(state.get("last_manage_date"))
+    state_signal = read_signal_timestamp(strategy_id)
+    health = compute_health(state_scan, state_manage, state_signal)
 
     log_mtime = None
-    if not (last_scan_at and last_manage_at and last_signal_at):
+    if not (state_scan and state_manage and state_signal):
         log_mtime = latest_log_mtime(strategy_id)
-    last_scan_at = last_scan_at or log_mtime
-    last_manage_at = last_manage_at or log_mtime
-    last_signal_at = last_signal_at or log_mtime
-
-    health = compute_health(last_scan_at, last_manage_at, last_signal_at)
+    last_scan_at = state_scan or log_mtime
+    last_manage_at = state_manage or log_mtime
+    last_signal_at = state_signal or log_mtime
 
     return {
         "id": strategy_id,

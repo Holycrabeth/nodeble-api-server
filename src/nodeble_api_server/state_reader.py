@@ -277,7 +277,4 @@ def compute_health(
         age = (now - dt).total_seconds()
         if age > threshold_sec:
             return "warning"
-    # Scan/manage both present but parse failed → degrade to warning (conservative)
-    if not last_scan_at or not last_manage_at:
-        return "critical"
     return "healthy"

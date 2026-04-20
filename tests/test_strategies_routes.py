@@ -169,6 +169,25 @@ def test_get_strategy_installed_in_registry_but_no_state_returns_card(client):
     assert data["health"] == "critical"  # no scan/manage timestamps
 
 
+def test_health_stays_critical_even_if_log_mtime_is_recent(fake_home):
+    """Regression: the log-mtime fallback is DISPLAY only; it must NOT flip
+    an empty-state strategy from 'critical' to 'healthy'.
+    Before the Collar fix, log mtime was fed into compute_health, which
+    falsely marked stale strategies as healthy just because cron touched a log.
+    """
+    # pmcc has no state.json but drop a fresh log file
+    pmcc_logs = fake_home / ".nodeble-pmcc" / "logs"
+    pmcc_logs.mkdir(parents=True, exist_ok=True)
+    (pmcc_logs / "nodeble-pmcc.log").write_text("recent cron activity")
+
+    client = TestClient(app)
+    r = client.get("/api/v1/strategies/pmcc", headers=_auth()).json()
+    # Display timestamps populated from log mtime (user can still see "last log touch")
+    assert r["last_scan_at"] is not None
+    # But health must stay critical because state.json is missing
+    assert r["health"] == "critical"
+
+
 # ── /api/v1/strategies/{id}/positions ───────────────────────────────────────
 
 def test_get_positions_returns_array_with_spread_id(client):
