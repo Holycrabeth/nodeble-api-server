@@ -9,17 +9,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from nodeble_api_server.auth import require_bearer_token
 from nodeble_api_server.state_reader import (
     STRATEGY_REGISTRY,
-    compute_health,
-    count_active_positions,
-    latest_log_mtime,
+    build_strategy_card,
     list_installed_strategies,
-    normalize_timestamp,
     positions_as_list,
     read_allocation,
     read_config,
-    read_signal_timestamp,
     read_state,
-    sum_active_budget,
 )
 
 router = APIRouter(
@@ -28,71 +23,17 @@ router = APIRouter(
 )
 
 
-def _build_card(strategy_id: str) -> dict:
-    meta = STRATEGY_REGISTRY[strategy_id]
-    state = read_state(strategy_id) or {}
-    config = read_config(strategy_id) or {}
-    allocation = read_allocation() or {}
-
-    enabled = config.get("mode", "live") != "disabled"
-
-    positions_raw = state.get("positions", {})
-    open_positions = count_active_positions(positions_raw)
-    budget_used = sum_active_budget(positions_raw)
-
-    alloc_key = meta.get("allocation_key", strategy_id)
-    alloc_entry = (allocation.get("strategies") or {}).get(alloc_key) or {}
-    budget_max = (
-        alloc_entry.get("max_buying_power")
-        or (config.get("capital") or {}).get("budget")
-        or 0
-    )
-
-    # Health is computed from state.json / signal_state.json ONLY.
-    # log mtime is display-only fallback so stale strategies don't masquerade as healthy
-    # just because their log file was touched (e.g. by logrotate or a tail).
-    state_scan = normalize_timestamp(state.get("last_scan_date"))
-    state_manage = normalize_timestamp(state.get("last_manage_date"))
-    state_signal = read_signal_timestamp(strategy_id)
-    health = compute_health(state_scan, state_manage, state_signal)
-
-    log_mtime = None
-    if not (state_scan and state_manage and state_signal):
-        log_mtime = latest_log_mtime(strategy_id)
-    last_scan_at = state_scan or log_mtime
-    last_manage_at = state_manage or log_mtime
-    last_signal_at = state_signal or log_mtime
-
-    return {
-        "id": strategy_id,
-        "name": meta["name"],
-        "enabled": enabled,
-        "open_positions": open_positions,
-        "budget_used": budget_used,
-        "budget_max": budget_max,
-        "last_signal_at": last_signal_at,
-        "last_scan_at": last_scan_at,
-        "last_manage_at": last_manage_at,
-        "health": health,
-        "version": None,
-        "today_pnl": None,
-        "cumulative_pnl_7d": None,
-        "cumulative_pnl_30d": None,
-        "circuit_breaker": None,
-    }
-
-
 @router.get("")
 def list_strategies() -> dict:
     installed = list_installed_strategies()
-    return {"strategies": [_build_card(sid) for sid in installed]}
+    return {"strategies": [build_strategy_card(sid) for sid in installed]}
 
 
 @router.get("/{strategy_id}")
 def get_strategy(strategy_id: str) -> dict:
     if strategy_id not in STRATEGY_REGISTRY:
         raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
-    card = _build_card(strategy_id)
+    card = build_strategy_card(strategy_id)
     card["config"] = read_config(strategy_id)
     allocation = read_allocation() or {}
     meta = STRATEGY_REGISTRY[strategy_id]

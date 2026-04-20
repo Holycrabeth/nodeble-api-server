@@ -249,6 +249,64 @@ def sum_active_budget(positions_raw: Any) -> float:
 
 # ── Health ──────────────────────────────────────────────────────────────────
 
+def build_strategy_card(strategy_id: str, home: Path | None = None) -> dict:
+    """Assemble the StrategyCard dict for a single strategy.
+
+    Used by GET /api/v1/strategies (HTTP) and the WS broadcaster. Health is
+    computed from state/signal timestamps only — log mtime is a display-only
+    fallback so stale strategies don't masquerade as healthy just because
+    their log file was touched (e.g. by logrotate or a tail).
+    """
+    meta = STRATEGY_REGISTRY[strategy_id]
+    state = read_state(strategy_id, home=home) or {}
+    config = read_config(strategy_id, home=home) or {}
+    allocation = read_allocation(home=home) or {}
+
+    enabled = config.get("mode", "live") != "disabled"
+
+    positions_raw = state.get("positions", {})
+    open_positions = count_active_positions(positions_raw)
+    budget_used = sum_active_budget(positions_raw)
+
+    alloc_key = meta.get("allocation_key", strategy_id)
+    alloc_entry = (allocation.get("strategies") or {}).get(alloc_key) or {}
+    budget_max = (
+        alloc_entry.get("max_buying_power")
+        or (config.get("capital") or {}).get("budget")
+        or 0
+    )
+
+    state_scan = normalize_timestamp(state.get("last_scan_date"))
+    state_manage = normalize_timestamp(state.get("last_manage_date"))
+    state_signal = read_signal_timestamp(strategy_id, home=home)
+    health = compute_health(state_scan, state_manage, state_signal)
+
+    log_mtime = None
+    if not (state_scan and state_manage and state_signal):
+        log_mtime = latest_log_mtime(strategy_id, home=home)
+    last_scan_at = state_scan or log_mtime
+    last_manage_at = state_manage or log_mtime
+    last_signal_at = state_signal or log_mtime
+
+    return {
+        "id": strategy_id,
+        "name": meta["name"],
+        "enabled": enabled,
+        "open_positions": open_positions,
+        "budget_used": budget_used,
+        "budget_max": budget_max,
+        "last_signal_at": last_signal_at,
+        "last_scan_at": last_scan_at,
+        "last_manage_at": last_manage_at,
+        "health": health,
+        "version": None,
+        "today_pnl": None,
+        "cumulative_pnl_7d": None,
+        "cumulative_pnl_30d": None,
+        "circuit_breaker": None,
+    }
+
+
 def compute_health(
     last_scan_at: str | None,
     last_manage_at: str | None,

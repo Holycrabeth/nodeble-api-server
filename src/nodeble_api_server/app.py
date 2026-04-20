@@ -1,20 +1,33 @@
 """FastAPI application for nodeble-api-server.
 
-/health is intentionally public. All other routes go under /api/v1 and
-depend on `auth.require_bearer_token`.
+/health is intentionally public. All other HTTP routes go under /api/v1
+and depend on `auth.require_bearer_token`. The WS endpoint /api/v1/ws
+authenticates via query-param token (handled inline in ws.py).
 """
-import socket
-import time
+import asyncio
+from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, Depends, FastAPI
 
-from nodeble_api_server import __version__
+from nodeble_api_server import __version__, ws
 from nodeble_api_server.auth import require_bearer_token
+from nodeble_api_server.snapshot import build_server_info
 
-API_VERSION = "v1"
-_START_TIME = time.monotonic()
 
-app = FastAPI(title="NODEBLE API Server", version=__version__)
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    task = asyncio.create_task(ws.broadcast_loop(ws.manager))
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="NODEBLE API Server", version=__version__, lifespan=lifespan)
 
 
 @app.get("/health")
@@ -27,12 +40,7 @@ api_v1 = APIRouter(prefix="/api/v1", dependencies=[Depends(require_bearer_token)
 
 @api_v1.get("/server/info")
 def server_info() -> dict:
-    return {
-        "version": __version__,
-        "api_version": API_VERSION,
-        "hostname": socket.gethostname(),
-        "uptime_sec": int(time.monotonic() - _START_TIME),
-    }
+    return build_server_info()
 
 
 app.include_router(api_v1)
@@ -41,3 +49,4 @@ app.include_router(api_v1)
 from nodeble_api_server.routes import strategies as _strategies  # noqa: E402
 
 app.include_router(_strategies.router)
+app.include_router(ws.router)

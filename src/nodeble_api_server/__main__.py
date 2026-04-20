@@ -19,6 +19,14 @@ def _run_server() -> None:
     kwargs: dict = {
         "host": cfg.server.host,
         "port": cfg.server.port,
+        # access_log=False: default uvicorn format logs the full URL including
+        # `?token=...`, which leaks tokens to stdout / any redirected log.
+        "access_log": False,
+        # WS keepalive: Mac lid-close + wake is a common scenario where TCP
+        # won't notice the broken socket for minutes. Ping every 20s with a
+        # 10s timeout forces a fast disconnect → client triggers reconnect.
+        "ws_ping_interval": 20.0,
+        "ws_ping_timeout": 10.0,
     }
     if cfg.tls.enabled:
         kwargs["ssl_certfile"] = str(cfg.tls.cert_path)
