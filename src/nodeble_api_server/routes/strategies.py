@@ -7,6 +7,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from nodeble_api_server.auth import require_bearer_token
+from nodeble_api_server.logs import tail_bytes
 from nodeble_api_server.state_reader import (
     STRATEGY_REGISTRY,
     build_strategy_card,
@@ -15,6 +16,7 @@ from nodeble_api_server.state_reader import (
     read_allocation,
     read_config,
     read_state,
+    strategy_log_path,
 )
 
 router = APIRouter(
@@ -50,3 +52,30 @@ def get_positions(strategy_id: str) -> dict:
     if state is None:
         return {"positions": []}
     return {"positions": positions_as_list(state.get("positions", []))}
+
+
+@router.get("/{strategy_id}/logs")
+def get_logs(
+    strategy_id: str,
+    cursor: int | None = None,
+    limit: int = 200,
+) -> dict:
+    """Return a chunk of strategy log lines.
+
+    - Unknown strategy id → 404.
+    - Log file missing (strategy never ran, or log_path unconfigured) →
+      200 with empty lines + cursor=0 so the UI can render an empty state
+      instead of an error banner.
+    - cursor None → initial reverse read of last `limit` lines from EOF.
+    - cursor valid → incremental read from cursor to EOF.
+    - cursor exceeds file size (rotate) → return initial read with
+      truncated=True so the client resets its accumulated buffer.
+    """
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+    path = strategy_log_path(strategy_id)
+    if path is None:
+        # Strategy exists but has no log_file mapping — same shape as
+        # missing file, still 200 so UI stays consistent.
+        return {"lines": [], "cursor": 0, "truncated": False}
+    return tail_bytes(path, cursor, limit)

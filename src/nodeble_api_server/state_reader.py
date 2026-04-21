@@ -25,15 +25,24 @@ import yaml
 SERVER_TZ = ZoneInfo("America/New_York")
 
 STRATEGY_REGISTRY: dict[str, dict[str, str]] = {
-    "ic":                {"name": "Iron Condor",    "folder": ".nodeble"},
-    "wheel":             {"name": "Wheel",          "folder": ".nodeble-wheel"},
-    "pmcc":              {"name": "PMCC",           "folder": ".nodeble-pmcc"},
-    "calendar":          {"name": "Calendar",       "folder": ".nodeble-calendar"},
-    "collar":            {"name": "Collar",         "folder": ".nodeble-collar"},
-    "directionalspread": {"name": "Credit Spread",  "folder": ".nodeble-directionalspread", "allocation_key": "cs"},
-    "ironbutterfly":     {"name": "Iron Butterfly", "folder": ".nodeble-ironbutterfly"},
-    "straddle":          {"name": "Straddle",       "folder": ".nodeble-straddle"},
-    "strangle":          {"name": "Strangle",       "folder": ".nodeble-strangle"},
+    # log_file is the primary strategy-logic log file under <folder>/logs/.
+    # Survey on 2026-04-21 shows three format families across the 9 strategies:
+    #   1. Python stdlib text (ic/wheel/pmcc/directionalspread)
+    #      — "TS,ms MODULE LEVEL MSG" (no brackets around LEVEL)
+    #   2. JSON lines (calendar/ironbutterfly/straddle/strangle)
+    #      — {"ts", "lvl", "subsys", "msg", ...}
+    #   3. Mixed / stderr dumps (collar)
+    # straddle uses scanner.log (not bot.log) because bot.log is tiny Telegram-
+    # polling output while scanner.log has real scan decisions.
+    "ic":                {"name": "Iron Condor",    "folder": ".nodeble",                   "log_file": "nodeble.log"},
+    "wheel":             {"name": "Wheel",          "folder": ".nodeble-wheel",             "log_file": "nodeble-wheel.log"},
+    "pmcc":              {"name": "PMCC",           "folder": ".nodeble-pmcc",              "log_file": "nodeble-pmcc.log"},
+    "calendar":          {"name": "Calendar",       "folder": ".nodeble-calendar",          "log_file": "bot.log"},
+    "collar":            {"name": "Collar",         "folder": ".nodeble-collar",            "log_file": "bot.log"},
+    "directionalspread": {"name": "Credit Spread",  "folder": ".nodeble-directionalspread", "allocation_key": "cs", "log_file": "nodeble-directionalspread.log"},
+    "ironbutterfly":     {"name": "Iron Butterfly", "folder": ".nodeble-ironbutterfly",     "log_file": "bot.log"},
+    "straddle":          {"name": "Straddle",       "folder": ".nodeble-straddle",          "log_file": "scanner.log"},
+    "strangle":          {"name": "Strangle",       "folder": ".nodeble-strangle",          "log_file": "bot.log"},
 }
 
 ACTIVE_POSITION_STATUSES: frozenset[str] = frozenset({"open", "pending", "partial", "assigned"})
@@ -205,6 +214,17 @@ def latest_log_mtime(strategy_id: str, home: Path | None = None) -> str | None:
     if latest is None:
         return None
     return _from_ts_epoch(latest)
+
+
+def strategy_log_path(strategy_id: str, home: Path | None = None) -> Path | None:
+    """Absolute path to the strategy's primary log file. Returns None if
+    the strategy id isn't registered; returns a path even if the file
+    doesn't yet exist (callers decide how to handle missing files)."""
+    home = home or Path.home()
+    meta = STRATEGY_REGISTRY.get(strategy_id)
+    if not meta or "log_file" not in meta:
+        return None
+    return home / meta["folder"] / "logs" / meta["log_file"]
 
 
 # ── Position helpers ────────────────────────────────────────────────────────
