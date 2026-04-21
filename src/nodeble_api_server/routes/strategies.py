@@ -17,6 +17,7 @@ from nodeble_api_server.logs import tail_bytes
 from nodeble_api_server.state_reader import (
     STRATEGY_REGISTRY,
     build_strategy_card,
+    clear_cache,
     list_installed_strategies,
     positions_as_list,
     read_allocation,
@@ -186,6 +187,14 @@ def commit_config(strategy_id: str, payload: CommitPayload) -> dict:
         result="success",
         error=None,
     )
+
+    # 4) Invalidate state_reader's 5s TTL cache so the very next
+    # GET /api/v1/strategies/{id} (triggered by the frontend's
+    # invalidateQueries after a successful commit) sees the new YAML
+    # value instead of the pre-write cached copy. clear_cache is
+    # coarse-grained (drops everything) but cheap: the cache is 5s TTL
+    # anyway; one forced re-read costs a couple of file stats.
+    clear_cache()
 
     return {
         "committed": True,
