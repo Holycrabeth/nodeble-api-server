@@ -34,15 +34,24 @@ STRATEGY_REGISTRY: dict[str, dict[str, str]] = {
     #   3. Mixed / stderr dumps (collar)
     # straddle uses scanner.log (not bot.log) because bot.log is tiny Telegram-
     # polling output while scanner.log has real scan decisions.
-    "ic":                {"name": "Iron Condor",    "folder": ".nodeble",                   "log_file": "nodeble.log"},
-    "wheel":             {"name": "Wheel",          "folder": ".nodeble-wheel",             "log_file": "nodeble-wheel.log"},
-    "pmcc":              {"name": "PMCC",           "folder": ".nodeble-pmcc",              "log_file": "nodeble-pmcc.log"},
-    "calendar":          {"name": "Calendar",       "folder": ".nodeble-calendar",          "log_file": "bot.log"},
-    "collar":            {"name": "Collar",         "folder": ".nodeble-collar",            "log_file": "bot.log"},
-    "directionalspread": {"name": "Credit Spread",  "folder": ".nodeble-directionalspread", "allocation_key": "cs", "log_file": "nodeble-directionalspread.log"},
-    "ironbutterfly":     {"name": "Iron Butterfly", "folder": ".nodeble-ironbutterfly",     "log_file": "bot.log"},
-    "straddle":          {"name": "Straddle",       "folder": ".nodeble-straddle",          "log_file": "scanner.log"},
-    "strangle":          {"name": "Strangle",       "folder": ".nodeble-strangle",          "log_file": "bot.log"},
+    #
+    # config_shim maps to a module in nodeble_api_server.shims.* — the shim
+    # owns path resolution, validation, and atomic writes for that strategy.
+    # Four families (see shims/ for details):
+    #   group_a  — ic/wheel/pmcc/directionalspread (delegates to bot_helpers.validate_param + set_config_value)
+    #   calendar — api-server owns whitelist (calendar's set_config_param is non-atomic)
+    #   strangle — api-server owns whitelist (strangle's set_strategy_param is non-atomic + no range check)
+    #   <name>   — straddle/collar/ironbutterfly each have a small per-strategy shim because they expose NO setter
+    # repo_dir is where the strategy's venv and source live.
+    "ic":                {"name": "Iron Condor",    "folder": ".nodeble",                   "log_file": "nodeble.log",                   "config_shim": "group_a",       "repo_dir": "projects/nodeble"},
+    "wheel":             {"name": "Wheel",          "folder": ".nodeble-wheel",             "log_file": "nodeble-wheel.log",             "config_shim": "group_a",       "repo_dir": "projects/nodeble-wheel"},
+    "pmcc":              {"name": "PMCC",           "folder": ".nodeble-pmcc",              "log_file": "nodeble-pmcc.log",              "config_shim": "group_a",       "repo_dir": "projects/nodeble-pmcc"},
+    "calendar":          {"name": "Calendar",       "folder": ".nodeble-calendar",          "log_file": "bot.log",                       "config_shim": "calendar",      "repo_dir": "projects/nodeble-calendar"},
+    "collar":            {"name": "Collar",         "folder": ".nodeble-collar",            "log_file": "bot.log",                       "config_shim": "collar",        "repo_dir": "projects/nodeble-collar"},
+    "directionalspread": {"name": "Credit Spread",  "folder": ".nodeble-directionalspread", "allocation_key": "cs",                      "log_file": "nodeble-directionalspread.log", "config_shim": "group_a", "repo_dir": "projects/nodeble-directionalspread"},
+    "ironbutterfly":     {"name": "Iron Butterfly", "folder": ".nodeble-ironbutterfly",     "log_file": "bot.log",                       "config_shim": "ironbutterfly", "repo_dir": "projects/nodeble-ironbutterfly"},
+    "straddle":          {"name": "Straddle",       "folder": ".nodeble-straddle",          "log_file": "scanner.log",                   "config_shim": "straddle",      "repo_dir": "projects/nodeble-straddle"},
+    "strangle":          {"name": "Strangle",       "folder": ".nodeble-strangle",          "log_file": "bot.log",                       "config_shim": "strangle",      "repo_dir": "projects/nodeble-strangle"},
 }
 
 ACTIVE_POSITION_STATUSES: frozenset[str] = frozenset({"open", "pending", "partial", "assigned"})
@@ -225,6 +234,24 @@ def strategy_log_path(strategy_id: str, home: Path | None = None) -> Path | None
     if not meta or "log_file" not in meta:
         return None
     return home / meta["folder"] / "logs" / meta["log_file"]
+
+
+def strategy_venv_python(strategy_id: str, home: Path | None = None) -> Path | None:
+    """Absolute path to the strategy's venv python interpreter. Used by
+    config_writer.run_shim to invoke the target strategy's bot_helpers
+    with the correct dependencies."""
+    home = home or Path.home()
+    meta = STRATEGY_REGISTRY.get(strategy_id)
+    if not meta or "repo_dir" not in meta:
+        return None
+    return home / meta["repo_dir"] / ".venv" / "bin" / "python"
+
+
+def strategy_config_shim(strategy_id: str) -> str | None:
+    meta = STRATEGY_REGISTRY.get(strategy_id)
+    if not meta:
+        return None
+    return meta.get("config_shim")
 
 
 # ── Position helpers ────────────────────────────────────────────────────────
