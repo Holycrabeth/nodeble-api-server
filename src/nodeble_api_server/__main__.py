@@ -50,6 +50,12 @@ def main() -> None:
 
     gt = sub.add_parser("generate-token", help="Generate a new API token")
     gt.add_argument("label", help="Human-readable label, e.g. 'my-macbook'")
+    gt.add_argument(
+        "--if-missing",
+        action="store_true",
+        help="If a token for this label already exists, keep it and exit 0 "
+        "(idempotent). Default is to abort with exit 1.",
+    )
 
     rt = sub.add_parser("revoke-token", help="Revoke a token by its label")
     rt.add_argument("label")
@@ -59,7 +65,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "generate-token":
-        cli.generate_token(args.label)
+        cli.generate_token(args.label, if_missing=args.if_missing)
     elif args.cmd == "revoke-token":
         cli.revoke_token(args.label)
     elif args.cmd == "generate-cert":

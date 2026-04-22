@@ -41,8 +41,19 @@ def _load_yaml_or_empty(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def generate_token(label: str, cfg_path: Path = DEFAULT_CONFIG_PATH) -> str:
-    """Generate a UUID4 token, append to api.yaml valid_tokens. Returns token."""
+def generate_token(
+    label: str,
+    cfg_path: Path = DEFAULT_CONFIG_PATH,
+    if_missing: bool = False,
+) -> str:
+    """Generate a UUID4 token, append to api.yaml valid_tokens. Returns token.
+
+    When `if_missing=True` and a token for this label already exists, the
+    existing token is returned unchanged (with a friendly stdout note) —
+    used by install.sh to stay idempotent across re-runs. Default is the
+    strict behavior: duplicate label aborts with exit 1 so manual admin
+    token issuance can't silently fail closed.
+    """
     if not label or not label.strip():
         print("ERROR: label must be a non-empty string", file=sys.stderr)
         sys.exit(1)
@@ -53,6 +64,11 @@ def generate_token(label: str, cfg_path: Path = DEFAULT_CONFIG_PATH) -> str:
 
     for entry in tokens:
         if isinstance(entry, dict) and entry.get("label") == label:
+            if if_missing:
+                existing = entry.get("token", "")
+                print(f"Token with label '{label}' already exists — keeping existing.")
+                print(f"  {existing}")
+                return existing
             print(
                 f"ERROR: token with label '{label}' already exists. "
                 f"Revoke it first via: python -m nodeble_api_server revoke-token {label}",

@@ -32,6 +32,33 @@ def test_generate_token_duplicate_label_exits(tmp_path):
         cli.generate_token("phone", cfg_path=cfg)
 
 
+def test_generate_token_if_missing_returns_existing(tmp_path, capsys):
+    """install.sh re-runs must not abort on an already-issued label."""
+    cfg = tmp_path / "api.yaml"
+    first = cli.generate_token("desktop", cfg_path=cfg)
+    # Second call with if_missing=True should return same token, not exit.
+    second = cli.generate_token("desktop", cfg_path=cfg, if_missing=True)
+
+    assert second == first
+
+    # Only one entry in the file.
+    labels = [t["label"] for t in _read_yaml(cfg)["auth"]["valid_tokens"]]
+    assert labels == ["desktop"]
+
+    out = capsys.readouterr().out
+    assert "already exists" in out.lower()
+
+
+def test_generate_token_if_missing_generates_when_absent(tmp_path):
+    """if_missing should still create the token on a fresh install."""
+    cfg = tmp_path / "api.yaml"
+    token = cli.generate_token("desktop", cfg_path=cfg, if_missing=True)
+    assert len(token) == 36
+    tokens = _read_yaml(cfg)["auth"]["valid_tokens"]
+    assert len(tokens) == 1
+    assert tokens[0]["label"] == "desktop"
+
+
 def test_generate_token_appends(tmp_path):
     cfg = tmp_path / "api.yaml"
     cli.generate_token("mac", cfg_path=cfg)
