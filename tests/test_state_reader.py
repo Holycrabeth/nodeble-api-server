@@ -37,8 +37,10 @@ def _reset_cache():
 # ── normalize_timestamp (required by spec) ──────────────────────────────────
 
 def test_normalize_timestamp_date_only():
+    # Date-only strings anchor to end-of-day ET so health stays green
+    # for 24h after a run; see normalize_timestamp docstring.
     out = normalize_timestamp("2026-04-14")
-    assert out == "2026-04-14T00:00:00-04:00"  # EDT in effect
+    assert out == "2026-04-14T23:59:59-04:00"  # EDT, last moment of the day
 
 
 def test_normalize_timestamp_iso_without_tz():
@@ -64,9 +66,19 @@ def test_normalize_timestamp_malformed_returns_none():
 
 
 def test_normalize_timestamp_winter_date_uses_est():
-    # 2026-01-14 is in EST (-05:00), not EDT
+    # 2026-01-14 is in EST (-05:00), not EDT; end-of-day anchor.
     out = normalize_timestamp("2026-01-14")
-    assert out == "2026-01-14T00:00:00-05:00"
+    assert out == "2026-01-14T23:59:59-05:00"
+
+
+def test_normalize_timestamp_iso_datetime_unaffected_by_date_only_change():
+    """Full ISO datetimes never hit the end-of-day branch — they keep
+    their exact time. Prevents regression where the parser order got
+    flipped and stripped the time component."""
+    out = normalize_timestamp("2026-04-21T10:30:00-04:00")
+    assert out == "2026-04-21T10:30:00-04:00"
+    out = normalize_timestamp("2026-04-21T10:30:00")
+    assert out == "2026-04-21T10:30:00-04:00"
 
 
 # ── File readers with faked home ────────────────────────────────────────────
@@ -263,6 +275,26 @@ def test_health_warning_when_signal_stale():
     recent = now.isoformat()
     stale_signal = (now - timedelta(hours=48)).isoformat()
     assert compute_health(recent, recent, stale_signal, now=now) == "warning"
+
+
+def test_health_healthy_when_date_only_ran_yesterday():
+    """Regression: IC's state.json stores `last_scan_date="2026-04-21"`
+    as a bare date. Before the end-of-day fix, normalize_timestamp
+    anchored to 00:00 ET and the health calc saw ~25h of age the next
+    morning, flipping to `warning`. Now that date-only normalizes to
+    23:59:59 ET, the same scenario stays `healthy`."""
+    scan_date = normalize_timestamp("2026-04-21")
+    manage_date = scan_date
+    now_et = datetime(2026, 4, 22, 1, 0, 0, tzinfo=SERVER_TZ)  # 1 AM next day ET
+    assert compute_health(scan_date, manage_date, scan_date, now=now_et) == "healthy"
+
+
+def test_health_warning_when_date_only_ran_two_days_ago():
+    """Sanity: the fix doesn't over-correct. A scan from two days ago
+    should still age past the 24h threshold and trip warning."""
+    scan_date = normalize_timestamp("2026-04-19")
+    now_et = datetime(2026, 4, 22, 0, 0, 0, tzinfo=SERVER_TZ)
+    assert compute_health(scan_date, scan_date, scan_date, now=now_et) == "warning"
 
 
 # ── latest_log_mtime ─────────────────────────────────────────────────────────

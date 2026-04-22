@@ -135,7 +135,9 @@ def test_list_strategies_card_fields(client):
     assert ic["open_positions"] == 2
     assert ic["budget_used"] == 30000.0  # (100+200) * 1 * 100
     assert ic["budget_max"] == 5000      # from allocation.json
-    assert ic["last_scan_at"] == "2026-04-19T00:00:00-04:00"
+    # Date-only normalizes to end-of-day ET so health stays green for
+    # ~24h after a date-only run (M2.a follow-up fix).
+    assert ic["last_scan_at"] == "2026-04-19T23:59:59-04:00"
     assert ic["last_signal_at"] == "2026-04-19T13:00:00-04:00"
     assert ic["health"] in ("healthy", "warning")  # depends on 'now' vs fixture date
     assert ic["version"] is None

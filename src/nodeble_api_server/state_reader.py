@@ -100,15 +100,33 @@ def _read_yaml(path: Path) -> dict | None:
 
 # ── Timestamp normalization ─────────────────────────────────────────────────
 
+def _is_date_only(s: str) -> bool:
+    """True iff s looks exactly like 'YYYY-MM-DD' (10 chars, two dashes
+    in the right places, all digits elsewhere). Used so we can pick the
+    end-of-day branch before Python's datetime parser would silently
+    interpret the string as midnight."""
+    if len(s) != 10 or s[4] != "-" or s[7] != "-":
+        return False
+    return s[:4].isdigit() and s[5:7].isdigit() and s[8:10].isdigit()
+
+
 def normalize_timestamp(raw: Any) -> str | None:
     """Normalize a state.json timestamp to ISO 8601 + America/New_York.
 
     Accepted inputs:
     - ISO datetime with tz       → pass through (stays as-is)
     - ISO datetime without tz    → localize to ET
-    - Date-only "YYYY-MM-DD"     → treat as 00:00 ET that day
+    - Date-only "YYYY-MM-DD"     → treat as 23:59:59 ET that day
     - None / non-string / empty  → None
     - Malformed                  → None
+
+    Why end-of-day for date-only: IC / Wheel record only the date of
+    their scan/manage run. Midnight-anchoring would age the record by
+    up to 24 hours, triggering a spurious `warning` health right after
+    a successful run. End-of-day ET is the latest moment the date could
+    have meant and matches the user's mental model ("ran today → still
+    fresh"). The UI formats the resulting ISO via `formatRelative`,
+    which is happy with either time.
     """
     if not raw or not isinstance(raw, str):
         return None
@@ -116,19 +134,22 @@ def normalize_timestamp(raw: Any) -> str | None:
     if not s:
         return None
 
-    # ISO datetime (with or without tz)
+    # Date-only first — datetime.fromisoformat happily parses "YYYY-MM-DD"
+    # as midnight, which would shadow this branch if we tried the
+    # datetime path first. Explicit check keeps the semantic intent clear.
+    if _is_date_only(s):
+        try:
+            d = date.fromisoformat(s)
+        except ValueError:
+            return None
+        dt = datetime.combine(d, time_cls(23, 59, 59)).replace(tzinfo=SERVER_TZ)
+        return dt.isoformat()
+
+    # Full ISO datetime (with or without tz).
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=SERVER_TZ)
-        return dt.isoformat()
-    except ValueError:
-        pass
-
-    # Date-only
-    try:
-        d = date.fromisoformat(s)
-        dt = datetime.combine(d, time_cls.min).replace(tzinfo=SERVER_TZ)
         return dt.isoformat()
     except ValueError:
         pass
