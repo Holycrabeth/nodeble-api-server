@@ -143,9 +143,30 @@ def test_get_all_live_returns_disengaged(client_and_home):
     assert all(v == "live" for v in body["per_strategy_mode"].values())
 
 
-def test_get_all_dry_run_returns_engaged(client_and_home):
+def test_get_all_dry_run_after_engage_returns_engaged(client_and_home):
+    """After operator POSTs engage, state must be 'engaged' AND
+    engaged=true. We press via the API (not by flipping yaml directly)
+    so the intent audit entry is written — engaged=true is an
+    OPERATOR-intent flag, not a mode-aggregate derivation."""
+    client, *_ = client_and_home
+    client.post(
+        "/api/v1/system/killswitch",
+        headers=_hdr(),
+        json={"engaged": True},
+    )
+    r = client.get("/api/v1/system/killswitch", headers=_hdr())
+    body = r.json()
+    assert body["state"] == "engaged"
+    assert body["engaged"] is True
+
+
+def test_get_out_of_band_dry_run_without_engage_stays_disengaged(
+    client_and_home,
+):
+    """Someone hand-edits every strategy.yaml to dry_run without going
+    through the killswitch endpoint. Ground-truth state is 'engaged',
+    but operator intent is still disengaged — engaged=false."""
     client, tmp_path, _ = client_and_home
-    # Flip every yaml to dry_run manually.
     for meta in state_reader.STRATEGY_REGISTRY.values():
         p = tmp_path / meta["folder"] / "config" / "strategy.yaml"
         data = yaml.safe_load(p.read_text())
@@ -155,7 +176,7 @@ def test_get_all_dry_run_returns_engaged(client_and_home):
     r = client.get("/api/v1/system/killswitch", headers=_hdr())
     body = r.json()
     assert body["state"] == "engaged"
-    assert body["engaged"] is True
+    assert body["engaged"] is False  # no audit, no operator intent
 
 
 def test_get_mixed_returns_partial(client_and_home):
@@ -170,6 +191,29 @@ def test_get_mixed_returns_partial(client_and_home):
     r = client.get("/api/v1/system/killswitch", headers=_hdr())
     body = r.json()
     assert body["state"] == "partial"
+    # engaged=false even though state=partial, because no operator ever
+    # pressed the killswitch (baseline mixed state is normal for the 9
+    # strategies — Calendar etc. default to dry_run out of the box).
+    assert body["engaged"] is False
+
+
+def test_get_engaged_reflects_intent_not_aggregate(client_and_home):
+    """The critical UX guarantee — baseline mixed state must not flag
+    the TopBar as 'paused' on first app launch."""
+    client, tmp_path, _ = client_and_home
+    # Baseline-like: 4 live + 5 dry_run (matching real Tower baseline).
+    for sid in ("calendar", "collar", "ironbutterfly", "straddle", "strangle"):
+        meta = state_reader.STRATEGY_REGISTRY[sid]
+        p = tmp_path / meta["folder"] / "config" / "strategy.yaml"
+        data = yaml.safe_load(p.read_text())
+        data["mode"] = "dry_run"
+        p.write_text(yaml.safe_dump(data))
+
+    r = client.get("/api/v1/system/killswitch", headers=_hdr())
+    body = r.json()
+    assert body["state"] == "partial"
+    # No audit → operator hasn't pressed anything → engaged must be false
+    # regardless of how per-strategy modes happen to sit.
     assert body["engaged"] is False
 
 
@@ -317,7 +361,10 @@ def test_post_partial_failure_reports_partial_state(
     )
     body = r.json()
     assert body["state"] == "partial"  # wheel still live, others dry_run
-    assert body["engaged"] is False    # engaged requires ALL dry_run
+    # engaged reflects operator INTENT: they pressed engage, so engaged=true
+    # even though the fleet ended up partial. UI maps (engaged=true,
+    # state=partial) to the 🟡 "partial" button state with a retry CTA.
+    assert body["engaged"] is True
     assert body["result"]["wheel"]["ok"] is False
     assert "timeout" in body["result"]["wheel"]["error"].lower() or \
            "timed out" in body["result"]["wheel"]["error"].lower() or \
@@ -328,7 +375,8 @@ def test_post_partial_failure_reports_partial_state(
 
     sys_entries = [e for e in _read_audit(audit_file) if e["strategy"] == "system"]
     assert sys_entries[-1]["result"] == "partial"
-    assert sys_entries[-1]["new_value"] == "partial"
+    # new_value is intent ("engaged") — not the aggregate state.
+    assert sys_entries[-1]["new_value"] == "engaged"
 
 
 def test_post_reason_max_length_enforced(client_and_home):

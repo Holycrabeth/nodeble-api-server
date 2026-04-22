@@ -135,6 +135,37 @@ def _latest_system_audit() -> dict | None:
     return None
 
 
+def _latest_operator_intent() -> str:
+    """Last intent the operator committed via the killswitch endpoint.
+
+    Returns "engaged" / "disengaged". Defaults to "disengaged" when
+    there's no system/killswitch audit entry yet — fresh installs and
+    the baseline state after-smoke-cleanup both present as "operator
+    hasn't done anything with the killswitch yet".
+
+    Reading intent from audit (not from per-strategy aggregate state)
+    matters for UX: baseline installs have mixed per-strategy modes by
+    design (Calendar / Collar / Straddle / Strangle / IronButterfly
+    default to dry_run on fresh install). Keying engaged off the
+    aggregate would flag the TopBar button as "partial / paused" from
+    the moment the app first launches, which is wrong — the operator
+    never pressed engage. engaged must reflect operator intent, state
+    reflects ground truth, and the UI maps the (engaged, state) pair
+    onto a 4-way button state.
+    """
+    latest = _latest_system_audit()
+    if latest is None:
+        return "disengaged"
+    nv = latest.get("new_value")
+    if nv in ("engaged", "disengaged"):
+        return nv
+    # Back-compat with pre-intent audit entries that stored aggregate
+    # state in new_value (e.g. "partial"). Treat those as disengaged so
+    # we don't leave an app permanently orange after a partial failure
+    # in the pre-intent era.
+    return "disengaged"
+
+
 # ── GET: current state ──────────────────────────────────────────────────
 
 
@@ -146,22 +177,34 @@ def get_killswitch() -> dict:
     out-of-band `mode` change surfaces immediately. Registered strategies
     whose yaml is missing or unparseable are reported as `mode=null`
     and excluded from the aggregate-state calculation.
+
+    `engaged` reflects OPERATOR INTENT (last action through the
+    killswitch endpoint), not the aggregate-state of the fleet. The UI
+    pairs `engaged` + `state` to pick a 4-way button render:
+        engaged=false                           → 🟢 running (baseline)
+        engaged=true  & state="engaged"         → 🔴 paused (all flipped)
+        engaged=true  & state="partial"         → 🟡 partial (some failed
+                                                   OR someone changed a
+                                                   strategy out-of-band)
+        engaged=true  & state="unknown"         → ⚠️ anomaly
     """
     per_strategy = {sid: _read_mode(sid) for sid in STRATEGY_REGISTRY}
     state = _aggregate_state(per_strategy)
+    intent = _latest_operator_intent()
 
     last = _latest_system_audit()
     engaged_at: str | None = None
     last_change_reason: str | None = None
     last_actor: str | None = None
-    if last is not None:
+    if last is not None and intent == "engaged":
         engaged_at = last.get("ts")
+    if last is not None:
         last_change_reason = last.get("reason") or None
         last_actor = last.get("actor")
 
     return {
         "state": state,  # "engaged" | "disengaged" | "partial" | "unknown"
-        "engaged": state == "engaged",
+        "engaged": intent == "engaged",  # operator intent
         "engaged_at": engaged_at,
         "last_change_reason": last_change_reason,
         "last_actor": last_actor,
@@ -189,14 +232,20 @@ def post_killswitch(payload: KillswitchPayload) -> dict:
       "shim_error"). Strategies already at the target get no per-
       strategy entry — avoids audit spam on double-clicks.
     - One system-level entry (strategy="system", param_path="killswitch",
-      old_value=<previous aggregate state>, new_value=<engaged bool>)
-      summarising the operator decision.
+      old_value=<previous operator intent>, new_value=<new intent>)
+      recording the operator decision. new_value is "engaged" or
+      "disengaged" — not the aggregate state — so GET can derive the
+      `engaged` flag purely from the latest audit entry without
+      consulting per-strategy modes.
     """
     target_mode = "dry_run" if payload.engaged else "live"
+    target_intent = "engaged" if payload.engaged else "disengaged"
 
-    # Snapshot the starting state for the system audit entry's old_value.
+    # Snapshot the starting state: pre_state for UI "summary" text,
+    # pre_intent for the system audit's old_value.
     pre_modes = {sid: _read_mode(sid) for sid in STRATEGY_REGISTRY}
     pre_state = _aggregate_state(pre_modes)
+    pre_intent = _latest_operator_intent()
 
     reason = payload.reason or ""
     # Namespace the reason so per-strategy audit entries are obviously
@@ -311,8 +360,8 @@ def post_killswitch(payload: KillswitchPayload) -> dict:
     write_event(
         strategy=_SYSTEM_STRATEGY_KEY,
         param_path=_SYSTEM_PARAM_PATH,
-        old_value=pre_state,
-        new_value=post_state,
+        old_value=pre_intent,
+        new_value=target_intent,
         reason=reason,
         result=sys_result,
         error=None,
@@ -320,9 +369,12 @@ def post_killswitch(payload: KillswitchPayload) -> dict:
 
     now_iso = datetime.now(_SERVER_TZ).isoformat()
     return {
-        "engaged": post_state == "engaged",
+        # engaged reflects OPERATOR INTENT (what they just requested),
+        # not the aggregate state. State handles ground truth; the UI
+        # uses (engaged, state) together to pick a 4-way button render.
+        "engaged": payload.engaged,
         "state": post_state,
-        "engaged_at": now_iso if post_state == "engaged" else None,
+        "engaged_at": now_iso if payload.engaged else None,
         "result": result,
         "summary": f"{ok_count}/{total} 策略成功切换 · 状态 {post_state}",
     }
