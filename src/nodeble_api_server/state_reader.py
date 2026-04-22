@@ -301,11 +301,40 @@ def count_active_positions(positions_raw: Any) -> int:
 
 
 def sum_active_budget(positions_raw: Any) -> float:
-    """Σ max_risk × contracts × 100 over active positions (same formula bot_helpers uses)."""
+    """Σ capital deployed across active positions.
+
+    ARCH-12 scheme B: each strategy writes its own per-position
+    `capital_used` (USD float) using its own formula (see spec §3).
+    api-server is a dumb summer; it doesn't know or encode any
+    per-strategy capital semantics. This closes the "api-server's
+    IC-formula guessing Wheel/Calendar/Collar capital wrong" bug class.
+
+    Precedence per position:
+      1. `capital_used` present → trust it (authoritative per module).
+         Malformed / non-float → skip (don't fall back — a bad
+         capital_used is a schema contract violation, not a signal to
+         invent a number).
+      2. Missing → fall back to the IC formula (max_risk × contracts
+         × 100). Correct for IC/DS/IB; wrong but non-crashing for
+         Wheel/PMCC/Calendar/Collar/Straddle/Strangle. This branch
+         disappears post-ARCH-12 rollout (target 2026-05-20); once all
+         9 modules write `capital_used`, remove the else arm and fail
+         loudly on missing.
+    """
     total = 0.0
     for p in positions_as_list(positions_raw):
         if p.get("status") not in ACTIVE_POSITION_STATUSES:
             continue
+
+        # Scheme-B authoritative field.
+        if "capital_used" in p:
+            try:
+                total += float(p["capital_used"])
+            except (TypeError, ValueError):
+                pass  # malformed → skip; never silently fall back
+            continue
+
+        # Legacy fallback (remove 2026-05-20 per ARCH-12 §7).
         max_risk = p.get("max_risk") or 0
         contracts = p.get("contracts") or 1
         try:

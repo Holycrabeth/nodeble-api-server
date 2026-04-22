@@ -238,13 +238,83 @@ def test_count_active_filters_closed_variants():
     assert count_active_positions(positions) == 2
 
 
-def test_sum_active_budget():
+def test_sum_active_budget_fallback_formula():
+    """Legacy path: no capital_used field → IC formula
+    (max_risk × contracts × 100). Kept through 2026-05-20 rollout so
+    modules that haven't migrated to ARCH-12 yet still contribute
+    (wrongly, but non-crashingly)."""
     positions = [
         {"status": "open", "max_risk": 100, "contracts": 2},       # 100*2*100 = 20000
         {"status": "assigned", "max_risk": 50, "contracts": 1},    # 50*1*100  =  5000
         {"status": "closed_profit", "max_risk": 999, "contracts": 999},  # ignored
     ]
     assert sum_active_budget(positions) == 25000
+
+
+# ── ARCH-12 scheme B: capital_used takes precedence ────────────────────────
+
+
+def test_sum_active_budget_capital_used_is_authoritative():
+    """When a position carries capital_used, sum_active_budget must
+    use it even if max_risk would give a different answer. Modules
+    own their own capital semantics (spec §3)."""
+    positions = [
+        # Wheel CSP: capital_used = strike × contracts × 100, max_risk absent.
+        {"status": "open", "capital_used": 58500.0},
+        # DS defined-risk: capital_used carried alongside max_risk; use the former.
+        {"status": "open", "capital_used": 1040.0, "max_risk": 5.20, "contracts": 2},
+    ]
+    assert sum_active_budget(positions) == 59540.0
+
+
+def test_sum_active_budget_capital_used_respects_zero():
+    """ARCH-12 §3.5: Wheel CC positions legitimately set capital_used=0.0
+    (already counted in linked assigned-put position). Must not trigger
+    the fallback formula (which would double-count)."""
+    positions = [
+        # CSP contributes 58,500 via capital_used.
+        {"status": "open", "capital_used": 58500.0},
+        # CC has capital_used=0 AND has strike/contracts that would
+        # otherwise activate the fallback formula if capital_used
+        # weren't present. Explicit 0 must be honored.
+        {"status": "open", "capital_used": 0.0, "strike": 590, "contracts": 1},
+    ]
+    assert sum_active_budget(positions) == 58500.0
+
+
+def test_sum_active_budget_mixed_migrated_and_legacy():
+    """During rollout Phase 1-3, a single sum may span ARCH-12-migrated
+    positions (IC) and legacy ones (PMCC etc). Both contribute."""
+    positions = [
+        {"status": "open", "capital_used": 1040.0},                  # migrated: 1040
+        {"status": "open", "max_risk": 50, "contracts": 1},          # legacy: 50*1*100 = 5000
+    ]
+    assert sum_active_budget(positions) == 6040.0
+
+
+def test_sum_active_budget_malformed_capital_used_is_skipped():
+    """Malformed capital_used (string, None) = schema contract violation.
+    Spec §7: skip the position entirely — don't silently fall back to
+    max_risk, which would hide the real bug."""
+    positions = [
+        {"status": "open", "capital_used": "not-a-number", "max_risk": 100, "contracts": 2},
+        {"status": "open", "capital_used": None, "max_risk": 50, "contracts": 1},
+        {"status": "open", "capital_used": 200.0},  # the one that should sum
+    ]
+    assert sum_active_budget(positions) == 200.0
+
+
+def test_sum_active_budget_capital_used_as_of_is_ignored_for_sum():
+    """capital_used_as_of is a staleness timestamp for downstream
+    warning logic; sum_active_budget itself must not choke on it."""
+    positions = [
+        {
+            "status": "open",
+            "capital_used": 1000.0,
+            "capital_used_as_of": "2026-04-22T18:30:00+00:00",
+        },
+    ]
+    assert sum_active_budget(positions) == 1000.0
 
 
 # ── Health ──────────────────────────────────────────────────────────────────
