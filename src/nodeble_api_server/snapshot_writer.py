@@ -48,10 +48,19 @@ _DEFAULT_SNAPSHOT_PATH = Path(
     "~/.nodeble-api/history/daily-pnl.jsonl"
 ).expanduser()
 
+_DEFAULT_POSITIONS_SNAPSHOT_PATH = Path(
+    "~/.nodeble-api/history/daily-positions.jsonl"
+).expanduser()
+
 
 def snapshot_path() -> Path:
     """Resolved at call time so tests can monkeypatch HOME."""
     return _DEFAULT_SNAPSHOT_PATH
+
+
+def positions_snapshot_path() -> Path:
+    """Resolved at call time so tests can monkeypatch HOME."""
+    return _DEFAULT_POSITIONS_SNAPSHOT_PATH
 
 
 def _next_snapshot_time(now: datetime) -> datetime:
@@ -195,6 +204,91 @@ def take_daily_snapshot(
     with open(path, "a", encoding="utf-8") as f:
         for row in to_write:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    return to_write
+
+
+def _build_positions_row(
+    strategy_id: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Assemble one row for the positions snapshot — raw passthrough of
+    the state.json `positions` value. No normalization: the frontend
+    already knows how to render heterogeneous position shapes, and
+    keeping the snapshot close to source makes future migrations
+    (e.g. replaying into a reconciler) easier."""
+    row: dict[str, Any] = {
+        "date": now.strftime("%Y-%m-%d"),
+        "snapshot_at": now.isoformat(),
+        "strategy": strategy_id,
+        "positions": [],
+    }
+
+    state = read_state(strategy_id)
+    if not state:
+        return row
+
+    raw_positions = state.get("positions")
+    if raw_positions is None:
+        return row
+
+    # state_reader uses dict-of-records for some strategies (IC, PMCC)
+    # and list-of-records for others. Normalize to a list so the wire
+    # shape is uniform; individual record structure is preserved.
+    if isinstance(raw_positions, dict):
+        row["positions"] = [
+            {**v, "_spread_id": k}
+            if isinstance(v, dict) and "_spread_id" not in v
+            else v
+            for k, v in raw_positions.items()
+            if isinstance(v, dict)
+        ]
+    elif isinstance(raw_positions, list):
+        row["positions"] = [p for p in raw_positions if isinstance(p, dict)]
+    # Other shapes → leave as empty list (row still written).
+
+    return row
+
+
+def take_daily_positions_snapshot(
+    now: datetime | None = None,
+    path: Path | None = None,
+) -> list[dict]:
+    """Write one JSONL row per strategy to daily-positions.jsonl.
+
+    Same idempotency contract as `take_daily_snapshot`: skips
+    strategies that already have a row for today's date. A separate
+    file so PnL vs positions concerns don't entangle in the reader
+    paths + we can rotate / archive them on different schedules later.
+    """
+    if now is None:
+        now = datetime.now(SERVER_TZ)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=SERVER_TZ)
+    else:
+        now = now.astimezone(SERVER_TZ)
+
+    path = path or positions_snapshot_path()
+    date_str = now.strftime("%Y-%m-%d")
+    already = _already_snapshotted_today(path, date_str)
+    to_write: list[dict] = []
+    for strategy_id in STRATEGY_REGISTRY.keys():
+        if strategy_id in already:
+            continue
+        try:
+            row = _build_positions_row(strategy_id, now)
+            to_write.append(row)
+        except Exception:
+            log.exception("positions snapshot row failed for %s", strategy_id)
+
+    if not to_write:
+        return []
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for row in to_write:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         f.flush()
         os.fsync(f.fileno())
     return to_write

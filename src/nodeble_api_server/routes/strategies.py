@@ -19,7 +19,15 @@ from nodeble_api_server.auth import require_bearer_token
 from nodeble_api_server.config_writer import run_shim
 from nodeble_api_server.history_reader import compute_since_date, read_pnl_entries
 from nodeble_api_server.logs import tail_bytes
-from nodeble_api_server.snapshot_writer import snapshot_path as _snapshot_path
+from nodeble_api_server.positions_history_reader import (
+    is_valid_date_format,
+    read_available_dates,
+    read_positions_at_date,
+)
+from nodeble_api_server.snapshot_writer import (
+    positions_snapshot_path as _positions_snapshot_path,
+    snapshot_path as _snapshot_path,
+)
 from nodeble_api_server.state_reader import (
     STRATEGY_REGISTRY,
     build_strategy_card,
@@ -309,6 +317,54 @@ def get_pnl_history(
             }
             for e in entries
         ],
+    }
+
+
+@router.get("/{strategy_id}/history/positions")
+def get_positions_history(
+    strategy_id: str,
+    date: str | None = None,
+) -> dict:
+    """Single-fetch endpoint for the Positions Replay card:
+    - `available_dates`: newest-first list of snapshot dates (≤ 90 days)
+      for the date-nav dropdown
+    - Row for `date` (or the most-recent available if `date` is omitted):
+      `snapshot_at` + raw `positions` array
+
+    Unknown strategy_id → 404.
+    Malformed `date` param → 400. Valid-but-missing date → 200 with
+    empty positions + null snapshot_at (UI renders an empty state).
+    """
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown strategy: {strategy_id}"
+        )
+    if date is not None and not is_valid_date_format(date):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format (expected YYYY-MM-DD): {date!r}",
+        )
+
+    path = _positions_snapshot_path()
+    available = read_available_dates(path, strategy_id, days=90)
+    resolved_date = date or (available[0] if available else None)
+
+    if resolved_date is None:
+        return {
+            "strategy": strategy_id,
+            "requested_date": None,
+            "snapshot_at": None,
+            "positions": [],
+            "available_dates": [],
+        }
+
+    row = read_positions_at_date(path, strategy_id, resolved_date)
+    return {
+        "strategy": strategy_id,
+        "requested_date": resolved_date,
+        "snapshot_at": row.get("snapshot_at") if row else None,
+        "positions": row.get("positions", []) if row else [],
+        "available_dates": available,
     }
 
 
