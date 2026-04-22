@@ -35,11 +35,24 @@ def run_shim(
     """whitelist[dotted_path] = {"type": "float", "min": 0, "max": 1, ...,
        "config_file": "strategy.yaml" (default)}. Type is one of
        int / float / str / bool."""
+    if len(sys.argv) < 3:
+        emit({"ok": False, "old": None, "new": None, "error": "usage: <action> <strategy_id> [<param_path> <value_json>]"})
+        sys.exit(0)
+
+    action = sys.argv[1]
+
+    # `list` action: emit the whitelist keys and exit. No value arg.
+    if action == "list":
+        emit({"ok": True, "old": None, "new": sorted(whitelist.keys()), "error": None})
+        sys.exit(0)
+
     if len(sys.argv) < 5:
         emit({"ok": False, "old": None, "new": None, "error": "usage: <action> <strategy_id> <param_path> <value_json>"})
         sys.exit(0)
 
-    action, _strategy_id_arg, param_path, value_json = sys.argv[1:5]
+    _strategy_id_arg = sys.argv[2]
+    param_path = sys.argv[3]
+    value_json = sys.argv[4]
 
     defn = whitelist.get(param_path)
     if defn is None:

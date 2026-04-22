@@ -93,6 +93,30 @@ def _resolve_shim(strategy_id: str) -> tuple[str, str]:
     return shim, str(venv)
 
 
+@router.get("/{strategy_id}/config/editable-paths")
+def editable_paths(strategy_id: str) -> dict:
+    """Return the dotted config paths the UI is allowed to edit for this
+    strategy. Frontend uses this to grey out / tooltip non-editable rows
+    instead of letting users click ✎ only to get a 400 on validate.
+
+    Implementation delegates to the shim's `list` action — each family
+    knows its own whitelist (Group A reads yaml_path from *_PARAMS; B/C/D
+    read the keys of our own whitelist dict)."""
+    shim_name, venv_python = _resolve_shim(strategy_id)
+    result = run_shim(
+        venv_python=venv_python,  # type: ignore[arg-type]
+        shim_name=shim_name,
+        action="list",
+        strategy_id=strategy_id,
+        param_path="",  # unused by `list`
+        value=None,
+    )
+    if not result.ok:
+        raise HTTPException(status_code=500, detail=result.error or "list failed")
+    paths = result.new if isinstance(result.new, list) else []
+    return {"editable_paths": paths}
+
+
 @router.post("/{strategy_id}/config/validate")
 def validate_config(strategy_id: str, payload: ValidatePayload) -> dict:
     """Dry-run: run the shim's `validate` action without touching YAML.

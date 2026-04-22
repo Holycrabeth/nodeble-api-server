@@ -241,6 +241,26 @@ def test_whitelist_shim_set_writes_atomically(tmp_path, monkeypatch, capsys):
     assert reloaded == {"selection": {"delta_min": 0.15, "dte_min": 30}}
 
 
+def test_whitelist_shim_list_returns_sorted_paths(tmp_path, monkeypatch, capsys):
+    """`list` action: no param/value args; just emit whitelist keys."""
+    from nodeble_api_server.shims import _whitelist_shim
+
+    strategy_dir = tmp_path / ".nodeble-strangle"
+    (strategy_dir / "config").mkdir(parents=True)
+    whitelist = {
+        "selection.dte_min": {"type": "int"},
+        "selection.delta_min": {"type": "float"},
+        "management.profit_take_pct": {"type": "float"},
+    }
+
+    monkeypatch.setattr("sys.argv", ["prog", "list", "strangle"])
+    with pytest.raises(SystemExit):
+        _whitelist_shim.run_shim("strangle", strategy_dir, whitelist)
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["ok"] is True
+    assert payload["new"] == sorted(whitelist.keys())
+
+
 def test_whitelist_shim_rejects_unknown_path(tmp_path, monkeypatch, capsys):
     from nodeble_api_server.shims import _whitelist_shim
 

@@ -56,11 +56,12 @@ def _config_path_for(strategy_dir: Path, defn: dict) -> Path:
 
 
 def main() -> None:
-    if len(sys.argv) < 5:
-        emit({"ok": False, "old": None, "new": None, "error": "usage: <action> <strategy_id> <param_path> <value_json>"})
+    if len(sys.argv) < 3:
+        emit({"ok": False, "old": None, "new": None, "error": "usage: <action> <strategy_id> [<param_path> <value_json>]"})
         sys.exit(0)
 
-    action, strategy_id, param_path, value_json = sys.argv[1:5]
+    action = sys.argv[1]
+    strategy_id = sys.argv[2]
 
     if strategy_id not in STRATEGY_CONFIG:
         emit({"ok": False, "old": None, "new": None, "error": f"unsupported strategy: {strategy_id}"})
@@ -77,6 +78,24 @@ def main() -> None:
     if not isinstance(params, dict):
         emit({"ok": False, "old": None, "new": None, "error": f"{params_name} missing or wrong type"})
         sys.exit(0)
+
+    # `list` emits the editable param_path whitelist for this strategy.
+    # No value_json arg required — short-circuit before the 5-arg check.
+    if action == "list":
+        paths = sorted({
+            defn.get("yaml_path")
+            for defn in params.values()
+            if isinstance(defn, dict) and defn.get("yaml_path")
+        })
+        emit({"ok": True, "old": None, "new": list(paths), "error": None})
+        sys.exit(0)
+
+    if len(sys.argv) < 5:
+        emit({"ok": False, "old": None, "new": None, "error": "usage: <action> <strategy_id> <param_path> <value_json>"})
+        sys.exit(0)
+
+    param_path = sys.argv[3]
+    value_json = sys.argv[4]
 
     alias = _alias_for_path(params, param_path)
     if alias is None:
