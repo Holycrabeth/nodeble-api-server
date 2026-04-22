@@ -196,3 +196,52 @@ def tail_bytes(
         "cursor": new_cursor,
         "truncated": truncated,
     }
+
+
+# ── History reader (for session extractor) ────────────────────────────────
+
+# Chunk size for the history view. 1 MB holds ~8 000 typical log lines —
+# enough for 24 h+ of session history on our busiest strategies (IC/Wheel
+# run every 5 minutes → ~280 cron sessions/day × ~14 lines/run ≈ 4 000 lines).
+_HISTORY_CHUNK_BYTES = 1024 * 1024  # 1 MB
+
+
+def read_recent_parsed_lines(
+    path: Path,
+    max_lines: int = 5000,
+    max_bytes: int = _HISTORY_CHUNK_BYTES,
+) -> list[dict[str, Any]]:
+    """Reverse-read the tail of a log file and return up to `max_lines`
+    parsed log-line dicts in chronological order (oldest first).
+
+    Used by session_extractor for the "运行历史" card on the History tab.
+    Unlike tail_bytes this has no cursor — it always grabs the most recent
+    slice and re-parses from scratch on every request. That's fine at our
+    traffic (History tab is cold, audit.jsonl uses the same pattern).
+
+    Missing file / stat errors → empty list, never raises.
+    """
+    if not path.exists():
+        return []
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+
+    chunk_start = max(0, size - max_bytes)
+    try:
+        with open(path, "rb") as f:
+            f.seek(chunk_start)
+            chunk = f.read()
+    except OSError:
+        return []
+
+    text = _decode(chunk)
+    split = text.splitlines()
+    # If we started mid-line (non-zero offset), the first entry is a
+    # partial line — drop it so we don't hand out a fragment.
+    if chunk_start > 0 and split:
+        split = split[1:]
+
+    tail_lines = split[-max_lines:] if max_lines > 0 else split
+    return [parse_log_line(line) for line in tail_lines]

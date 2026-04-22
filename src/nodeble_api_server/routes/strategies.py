@@ -17,8 +17,14 @@ from nodeble_api_server.audit import audit_path, write_event
 from nodeble_api_server.audit_reader import read_audit_entries
 from nodeble_api_server.auth import require_bearer_token
 from nodeble_api_server.config_writer import run_shim
+from dataclasses import asdict
+
 from nodeble_api_server.history_reader import compute_since_date, read_pnl_entries
-from nodeble_api_server.logs import tail_bytes
+from nodeble_api_server.logs import read_recent_parsed_lines, tail_bytes
+from nodeble_api_server.session_extractor import (
+    extract_session_detail,
+    extract_sessions,
+)
 from nodeble_api_server.positions_history_reader import (
     is_valid_date_format,
     read_available_dates,
@@ -366,6 +372,74 @@ def get_positions_history(
         "positions": row.get("positions", []) if row else [],
         "available_dates": available,
     }
+
+
+@router.get("/{strategy_id}/history/sessions")
+def get_session_history(
+    strategy_id: str,
+    limit: int = 20,
+    before_ts: str | None = None,
+) -> dict:
+    """Session list for the 运行历史 card on the History tab.
+
+    One "session" = a contiguous cron run's log lines, grouped by
+    sessionize-on-time-gap (default 180s). Returned newest-first.
+
+    - Unknown strategy id → 404.
+    - Missing log file (strategy never ran, or log_file unconfigured) →
+      200 with empty sessions list — UI renders the empty state.
+    - `limit` clamped to [1, 100]. `has_more` is True iff we returned
+      exactly `limit` entries (same heuristic as /history/config).
+    - `before_ts` pagination: pass the oldest returned session's
+      start_ts to get the next older page.
+
+    Reads up to the last ~1 MB of the log file (see
+    logs.read_recent_parsed_lines); older sessions beyond that window
+    are not paginate-able from this endpoint by design — the History
+    tab only shows recent-history cadence, not archived logs.
+    """
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+    path = strategy_log_path(strategy_id)
+    if path is None:
+        return {"sessions": [], "has_more": False}
+
+    capped_limit = max(1, min(limit, 100))
+    parsed = read_recent_parsed_lines(path)
+    sessions = extract_sessions(parsed, limit=capped_limit, before_ts=before_ts)
+    return {
+        "sessions": [asdict(s) for s in sessions],
+        "has_more": len(sessions) == capped_limit,
+    }
+
+
+@router.get("/{strategy_id}/history/sessions/detail")
+def get_session_detail(
+    strategy_id: str,
+    start_ts: str,
+    end_ts: str,
+) -> dict:
+    """Full parsed log-line list for a single session window.
+
+    Called when the user expands a session in the accordion. Only the
+    lines inside [start_ts, end_ts] come back, not the whole log file —
+    a heavy session is still bounded by the session's own size.
+
+    - Unknown strategy id → 404.
+    - Missing log file → 200 with empty lines.
+    - Lines without a parseable ts that follow an in-range line are
+      included (Python traceback tails etc.); see
+      session_extractor.extract_session_detail for the exact rule.
+    """
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+    path = strategy_log_path(strategy_id)
+    if path is None:
+        return {"lines": []}
+
+    parsed = read_recent_parsed_lines(path)
+    lines = extract_session_detail(parsed, start_ts=start_ts, end_ts=end_ts)
+    return {"lines": lines}
 
 
 @router.get("/{strategy_id}/logs")
