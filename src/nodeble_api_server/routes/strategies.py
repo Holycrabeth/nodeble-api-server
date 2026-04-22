@@ -10,7 +10,8 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from pydantic import BaseModel, Field
 
-from nodeble_api_server.audit import write_event
+from nodeble_api_server.audit import audit_path, write_event
+from nodeble_api_server.audit_reader import read_audit_entries
 from nodeble_api_server.auth import require_bearer_token
 from nodeble_api_server.config_writer import run_shim
 from nodeble_api_server.logs import tail_bytes
@@ -224,6 +225,38 @@ def commit_config(strategy_id: str, payload: CommitPayload) -> dict:
         "committed": True,
         "old_value": set_result.old,
         "new_value": set_result.new,
+    }
+
+
+@router.get("/{strategy_id}/history/config")
+def get_config_history(
+    strategy_id: str,
+    limit: int = 50,
+    before_ts: str | None = None,
+) -> dict:
+    """Return audit.jsonl entries scoped to this strategy, newest first.
+
+    - Unknown strategy id → 404 (matches other /strategies/{id}/* routes).
+    - `limit` is clamped to [1, 200] so no caller can pull the whole log
+      in one request.
+    - `before_ts`: for pagination. Pass the `ts` of the oldest entry in
+      the previous page to get the next older chunk.
+    - `has_more` is True iff we returned exactly `limit` entries. A
+      false positive here costs one empty "load more" request on the
+      very rare boundary case — cheaper than counting total events.
+    """
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+    capped_limit = max(1, min(limit, 200))
+    entries = read_audit_entries(
+        path=audit_path(),
+        strategy=strategy_id,
+        limit=capped_limit,
+        before_ts=before_ts,
+    )
+    return {
+        "entries": entries,
+        "has_more": len(entries) == capped_limit,
     }
 
 
