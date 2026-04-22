@@ -10,11 +10,16 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from pydantic import BaseModel, Field
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from nodeble_api_server.audit import audit_path, write_event
 from nodeble_api_server.audit_reader import read_audit_entries
 from nodeble_api_server.auth import require_bearer_token
 from nodeble_api_server.config_writer import run_shim
+from nodeble_api_server.history_reader import compute_since_date, read_pnl_entries
 from nodeble_api_server.logs import tail_bytes
+from nodeble_api_server.snapshot_writer import snapshot_path as _snapshot_path
 from nodeble_api_server.state_reader import (
     STRATEGY_REGISTRY,
     build_strategy_card,
@@ -257,6 +262,53 @@ def get_config_history(
     return {
         "entries": entries,
         "has_more": len(entries) == capped_limit,
+    }
+
+
+@router.get("/{strategy_id}/history/pnl")
+def get_pnl_history(
+    strategy_id: str,
+    days: int = 30,
+) -> dict:
+    """Per-day cumulative realized PnL for the chart on the History tab.
+
+    - Unknown strategy_id → 404.
+    - `days` clamped to [1, 365]. `since_date = today - (days - 1)` so
+      days=1 returns today only, days=30 returns a 30-calendar-day
+      window inclusive.
+    - Entries returned ascending by date (oldest first) so the chart
+      renders left→right in time order.
+    - `daily_delta` = cumulative[today] - cumulative[yesterday],
+      null on the first row or whenever either cumulative is null.
+    - Missing snapshot file (e.g. brand-new install pre-seed) → empty
+      entries list. UI handles this as the "数据积累中" empty state.
+    """
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown strategy: {strategy_id}"
+        )
+    days_clamped = max(1, min(days, 365))
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    since = compute_since_date(today, days_clamped)
+    entries = read_pnl_entries(
+        path=_snapshot_path(),
+        strategy=strategy_id,
+        since_date=since,
+    )
+    # Keep only the fields the chart needs (drop snapshot_at / budget
+    # internals for a smaller wire payload — the detail tab has those
+    # already via other routes).
+    return {
+        "strategy": strategy_id,
+        "entries": [
+            {
+                "date": e["date"],
+                "realized_pnl_cumulative": e.get("realized_pnl_cumulative"),
+                "open_positions_count": e.get("open_positions_count", 0),
+                "daily_delta": e.get("daily_delta"),
+            }
+            for e in entries
+        ],
     }
 
 

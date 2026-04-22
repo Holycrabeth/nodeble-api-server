@@ -5,26 +5,74 @@ and depend on `auth.require_bearer_token`. The WS endpoint /api/v1/ws
 authenticates via query-param token (handled inline in ws.py).
 """
 import asyncio
+import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, FastAPI
 
 from nodeble_api_server import __version__, ws
 from nodeble_api_server.auth import require_bearer_token
 from nodeble_api_server.snapshot import build_server_info
+from nodeble_api_server.snapshot_writer import (
+    SERVER_TZ as _SNAPSHOT_TZ,
+    _next_snapshot_time,
+    take_daily_snapshot,
+)
+
+log = logging.getLogger(__name__)
+
+
+async def _snapshot_loop() -> None:
+    """Seed-on-boot + one snapshot per ET 23:59 day.
+
+    Startup: fire take_daily_snapshot() immediately so today's first
+    point appears in the chart without waiting for midnight. Writer
+    is idempotent per (strategy, date), so restarting the process
+    mid-day won't duplicate rows.
+
+    Steady state: sleep until the next 23:59 ET, snapshot, loop.
+    Exceptions are logged and swallowed — a bad day shouldn't take
+    the scheduler down."""
+    try:
+        written = take_daily_snapshot()
+        if written:
+            log.info("snapshot_loop: seeded %d row(s)", len(written))
+    except Exception:
+        log.exception("snapshot_loop: initial seed failed")
+
+    while True:
+        try:
+            now = datetime.now(_SNAPSHOT_TZ)
+            next_run = _next_snapshot_time(now)
+            delay = (next_run - now).total_seconds()
+            await asyncio.sleep(max(1.0, delay))
+            written = take_daily_snapshot()
+            if written:
+                log.info("snapshot_loop: wrote %d row(s)", len(written))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("snapshot_loop: tick failed")
+            # On any transient failure, wait 60s then try the schedule
+            # again — prevents a tight error loop if the file system
+            # hiccups.
+            await asyncio.sleep(60)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    task = asyncio.create_task(ws.broadcast_loop(ws.manager))
+    ws_task = asyncio.create_task(ws.broadcast_loop(ws.manager))
+    snapshot_task = asyncio.create_task(_snapshot_loop())
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for task in (ws_task, snapshot_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="NODEBLE API Server", version=__version__, lifespan=lifespan)
