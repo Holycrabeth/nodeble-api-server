@@ -17,6 +17,10 @@ Why a dedicated endpoint instead of 9 /config writes from the client:
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +29,8 @@ from zoneinfo import ZoneInfo
 import yaml
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 from nodeble_api_server.audit import audit_path, write_event
 from nodeble_api_server.audit_reader import read_audit_entries
@@ -166,6 +172,111 @@ def _latest_operator_intent() -> str:
     return "disengaged"
 
 
+# ── Pre-engage snapshot (per-strategy mode restore on disengage) ────────
+
+
+def _snapshot_path() -> Path:
+    """Location of the pre-engage snapshot file.
+
+    Resolved via Path.home() so tests that monkeypatch Path.home()
+    land the file under tmp — no extra monkeypatching needed.
+    """
+    return Path.home() / ".nodeble-api" / "killswitch" / "pre_engage.json"
+
+
+def _write_snapshot(
+    per_strategy_mode: dict[str, str],
+    captured_reason: str,
+) -> bool:
+    """Atomically persist the pre-engage per-strategy mode map.
+
+    Called on the disengaged→engaged transition so a subsequent
+    disengage can restore each strategy to EXACTLY its pre-engage
+    mode — not to a blanket "live", which would flip the 5 baseline-
+    dry_run strategies (Calendar / Collar / IronButterfly / Straddle
+    / Strangle) into real trading against operator intent.
+
+    Returns True on success, False on any I/O error. Emergency use
+    case: a disk error must not block the operator's intent to flip
+    everything to dry_run. Caller logs ERROR on False so the
+    degraded-restore warning is visible.
+    """
+    path = _snapshot_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.error("killswitch snapshot: mkdir failed at %s: %s", path.parent, exc)
+        return False
+
+    payload_dict = {
+        "captured_at": datetime.now(_SERVER_TZ).isoformat(),
+        "captured_reason": captured_reason,
+        "per_strategy_mode": per_strategy_mode,
+    }
+    # tempfile + os.replace = atomic. A crash mid-write can never leave
+    # a half-written snapshot that would parse as valid JSON with
+    # missing keys.
+    try:
+        fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload_dict, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        logger.error("killswitch snapshot: write failed at %s: %s", path, exc)
+        return False
+
+    return True
+
+
+def _read_snapshot() -> dict[str, str] | None:
+    """Read the pre-engage snapshot's per_strategy_mode map, or None
+    if the file is absent, malformed, or structurally wrong.
+
+    Malformed snapshot is treated the same as missing — caller falls
+    back to flip-all-to-live with a WARNING. The schema contract here
+    is simple enough that we don't try to partial-recover; if JSON
+    or key shape is off, don't trust any of it.
+    """
+    path = _snapshot_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("killswitch snapshot: read failed at %s: %s", path, exc)
+        return None
+
+    psm = data.get("per_strategy_mode") if isinstance(data, dict) else None
+    if not isinstance(psm, dict):
+        logger.warning(
+            "killswitch snapshot: per_strategy_mode missing or wrong type "
+            "in %s",
+            path,
+        )
+        return None
+    # Coerce to dict[str, str] — skip entries whose values aren't strings.
+    return {
+        str(k): v for k, v in psm.items() if isinstance(v, str)
+    }
+
+
+def _delete_snapshot() -> None:
+    """Best-effort delete. Never raises — if we can't delete, the file
+    just sticks around; next engage overwrites anyway."""
+    path = _snapshot_path()
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("killswitch snapshot: unlink failed at %s: %s", path, exc)
+
+
 # ── GET: current state ──────────────────────────────────────────────────
 
 
@@ -237,27 +348,89 @@ def post_killswitch(payload: KillswitchPayload) -> dict:
       "disengaged" — not the aggregate state — so GET can derive the
       `engaged` flag purely from the latest audit entry without
       consulting per-strategy modes.
+
+    Pre-engage snapshot lifecycle (safety for the 5 baseline-dry_run
+    strategies — Calendar / Collar / IronButterfly / Straddle / Strangle):
+    - On disengaged→engaged transition, capture each strategy's current
+      mode to a snapshot file BEFORE flipping anything.
+    - On disengaged target, read the snapshot and restore each strategy
+      to its snapshot value (not a blanket "live").
+    - Missing / corrupt snapshot → fall back to flip-all-to-live with a
+      WARNING log. Preserves pre-snapshot behavior.
+    - Delete snapshot only on full disengage success. Partial failure
+      keeps it so the operator's retry uses the same baseline.
     """
-    target_mode = "dry_run" if payload.engaged else "live"
     target_intent = "engaged" if payload.engaged else "disengaged"
 
     # Snapshot the starting state: pre_state for UI "summary" text,
-    # pre_intent for the system audit's old_value.
+    # pre_intent for the system audit's old_value + the snapshot-write
+    # trigger (only write on disengaged→engaged transitions).
     pre_modes = {sid: _read_mode(sid) for sid in STRATEGY_REGISTRY}
     pre_state = _aggregate_state(pre_modes)
     pre_intent = _latest_operator_intent()
 
     reason = payload.reason or ""
-    # Namespace the reason so per-strategy audit entries are obviously
-    # killswitch-sourced even if the operator left `reason` blank.
-    per_strategy_reason = (
-        f"system.killswitch -> {target_mode}"
-        + (f" ({reason})" if reason else "")
-    )
 
+    # ── Decide the per-strategy target mode ──────────────────────────
+    # Engage: everyone to dry_run.
+    # Disengage: restore each strategy to its pre-engage snapshot mode,
+    #   or "live" as fallback when snapshot missing / corrupt / doesn't
+    #   know about this strategy (edge: strategy added post-engage).
+    target_per_strategy: dict[str, str] = {}
+    if payload.engaged:
+        for sid in STRATEGY_REGISTRY:
+            target_per_strategy[sid] = "dry_run"
+        # Write snapshot only on a real disengaged→engaged transition.
+        # Re-engage while already engaged preserves the original
+        # snapshot (oldest baseline wins).
+        if pre_intent == "disengaged":
+            snap_modes = {
+                sid: m for sid, m in pre_modes.items() if isinstance(m, str)
+            }
+            captured_reason = reason or "<no reason given>"
+            if not _write_snapshot(snap_modes, captured_reason):
+                # Write failed — log already emitted. Engage continues
+                # because operator intent is emergency-class (flip
+                # everything to dry_run). Degraded disengage (will
+                # fall back to all-live) is the tradeoff.
+                logger.error(
+                    "killswitch engage proceeding without snapshot — "
+                    "subsequent disengage will flip all to live"
+                )
+    else:
+        snapshot = _read_snapshot()
+        if snapshot is None:
+            # No snapshot + operator pressing disengage. Two cases:
+            # (a) never engaged through this endpoint → restore = all-live
+            # (b) snapshot was rm'd / corrupt → degraded restore.
+            # Both → fall back to flip-all-to-live (old pre-snapshot
+            # behavior). Warn so we notice if (b) starts happening in
+            # production.
+            logger.warning(
+                "killswitch disengage: no pre-engage snapshot — falling "
+                "back to flip-all-to-live. 5 baseline-dry_run strategies "
+                "(if any) may be flipped against operator intent."
+            )
+            for sid in STRATEGY_REGISTRY:
+                target_per_strategy[sid] = "live"
+        else:
+            for sid in STRATEGY_REGISTRY:
+                # Strategies absent from the snapshot (added between
+                # engage and disengage) default to "live" — same as
+                # the pre-snapshot behavior for unknown strategies.
+                target_per_strategy[sid] = snapshot.get(sid, "live")
+
+    # ── Per-strategy flip loop ───────────────────────────────────────
     result: dict[str, dict[str, Any]] = {}
     for sid, meta in STRATEGY_REGISTRY.items():
         current = pre_modes.get(sid)
+        target_mode = target_per_strategy[sid]
+
+        # Build reason per-strategy because the target now varies.
+        per_strategy_reason = (
+            f"system.killswitch -> {target_mode}"
+            + (f" ({reason})" if reason else "")
+        )
 
         # No-op path — skip the shim call + don't pollute audit.jsonl.
         if current == target_mode:
@@ -339,6 +512,14 @@ def post_killswitch(payload: KillswitchPayload) -> dict:
     # request reflects the new mode field instead of serving the 5-s
     # cached copy (mirrors what commit_config does for config edits).
     clear_cache()
+
+    # ── Snapshot cleanup on DISENGAGE ────────────────────────────────
+    # Delete only on full success — partial disengage leaves the
+    # snapshot so operator retry runs against the same baseline.
+    if not payload.engaged:
+        all_ok = all(r["ok"] for r in result.values())
+        if all_ok:
+            _delete_snapshot()
 
     # Re-read to compute the post aggregate state.
     post_modes = {sid: _read_mode(sid) for sid in STRATEGY_REGISTRY}
