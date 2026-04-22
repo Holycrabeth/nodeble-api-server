@@ -14,10 +14,13 @@ ISO 8601 + America/New_York.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import date, datetime, time as time_cls, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -344,6 +347,124 @@ def sum_active_budget(positions_raw: Any) -> float:
     return total
 
 
+# ── ARCH-12 capital_used staleness check ────────────────────────────────────
+
+_CAPITAL_USED_STALENESS_THRESHOLD_SEC = 24 * 3600  # 24h — spec §7
+# Don't re-warn the same (strategy, position) within this window. Dashboard
+# hits GET /api/v1/strategies every few seconds; without dedup a single stale
+# position would flood journald at request cadence.
+_CAPITAL_USED_WARN_COOLDOWN_SEC = 3600  # 1h
+
+# Module-level dict mapping (strategy_id, position_id) → last-warned epoch.
+# Grows bounded by the active-position set (≲ a few hundred across 9
+# strategies); acceptable for a single-worker uvicorn process.
+_last_stale_warning_at: dict[tuple[str, str], float] = {}
+
+
+def _reset_stale_warning_state() -> None:
+    """Test helper — drops the dedup cache so tests can assert warnings
+    fire on freshly-stale positions without cross-test pollution."""
+    _last_stale_warning_at.clear()
+
+
+def _parse_iso_epoch(iso: str | None) -> float | None:
+    """ISO 8601 → epoch seconds. Returns None on malformed / empty /
+    non-string input. Accepts the `Z` zulu shorthand (Python 3.11+
+    fromisoformat handles it natively)."""
+    if not isinstance(iso, str) or not iso.strip():
+        return None
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def check_stale_capital_used(
+    strategy_id: str,
+    positions_raw: Any,
+    now_epoch: float | None = None,
+) -> int:
+    """Log WARNING for each active position whose `capital_used_as_of`
+    is > 24h old or malformed. Returns count of stale positions found
+    (so tests can assert without peeking at log output).
+
+    Policy per ARCH-12 §7 "staleness early-warning signal":
+    - Positions missing `capital_used_as_of` are silently ignored. During
+      the 2026-05-20 rollout, most positions legitimately lack the field;
+      warning on absence would spam the log with known-incomplete data.
+    - Positions with a parseable timestamp > 24h old → WARN.
+    - Positions with a malformed timestamp → WARN (distinct reason —
+      that's a schema contract violation, not just staleness).
+    - Closed positions are skipped via status filter; stale capital on
+      a closed position doesn't affect any displayed sum.
+    - Dedup: same (strategy, pos) warns at most once per
+      _CAPITAL_USED_WARN_COOLDOWN_SEC (1h). Prevents log flooding at
+      dashboard poll cadence.
+    """
+    if now_epoch is None:
+        now_epoch = time.time()
+
+    stale_count = 0
+    for p in positions_as_list(positions_raw):
+        if p.get("status") not in ACTIVE_POSITION_STATUSES:
+            continue
+        if "capital_used_as_of" not in p:
+            continue  # pre-ARCH-12 position; legit missing during rollout
+
+        as_of_epoch = _parse_iso_epoch(p.get("capital_used_as_of"))
+        if as_of_epoch is None:
+            _maybe_warn_stale(
+                strategy_id,
+                p,
+                reason=f"malformed capital_used_as_of={p.get('capital_used_as_of')!r}",
+                now_epoch=now_epoch,
+            )
+            stale_count += 1
+            continue
+
+        age_sec = now_epoch - as_of_epoch
+        if age_sec > _CAPITAL_USED_STALENESS_THRESHOLD_SEC:
+            hours = age_sec / 3600.0
+            _maybe_warn_stale(
+                strategy_id,
+                p,
+                reason=f"{hours:.1f}h old (threshold 24h)",
+                now_epoch=now_epoch,
+            )
+            stale_count += 1
+
+    return stale_count
+
+
+def _maybe_warn_stale(
+    strategy_id: str,
+    position: dict,
+    reason: str,
+    now_epoch: float,
+) -> None:
+    """Emit a WARNING, deduped per (strategy, position) across the
+    cooldown window. `position_id` falls back through spread_id →
+    position_id → '<unknown>' so no position ever loses its warning
+    entirely due to an uncommon id scheme."""
+    pos_id = (
+        position.get("spread_id")
+        or position.get("position_id")
+        or "<unknown>"
+    )
+    key = (strategy_id, str(pos_id))
+    last = _last_stale_warning_at.get(key)
+    if last is not None and (now_epoch - last) < _CAPITAL_USED_WARN_COOLDOWN_SEC:
+        return
+
+    _last_stale_warning_at[key] = now_epoch
+    logger.warning(
+        "capital_used stale: strategy=%s pos=%s reason=%s",
+        strategy_id,
+        pos_id,
+        reason,
+    )
+
+
 # ── Health ──────────────────────────────────────────────────────────────────
 
 def build_strategy_card(strategy_id: str, home: Path | None = None) -> dict:
@@ -364,6 +485,11 @@ def build_strategy_card(strategy_id: str, home: Path | None = None) -> dict:
     positions_raw = state.get("positions", {})
     open_positions = count_active_positions(positions_raw)
     budget_used = sum_active_budget(positions_raw)
+    # ARCH-12 §7: log WARNING on any active position whose capital_used
+    # is > 24h stale or carries a malformed timestamp. Deduped per
+    # (strategy, pos) within 1h so dashboard polling doesn't flood.
+    # Return value ignored — side effect is the log line.
+    check_stale_capital_used(strategy_id, positions_raw)
 
     alloc_key = meta.get("allocation_key", strategy_id)
     alloc_entry = (allocation.get("strategies") or {}).get(alloc_key) or {}

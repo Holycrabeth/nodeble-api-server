@@ -317,6 +317,180 @@ def test_sum_active_budget_capital_used_as_of_is_ignored_for_sum():
     assert sum_active_budget(positions) == 1000.0
 
 
+# ── ARCH-12 §7: capital_used staleness warning ─────────────────────────────
+
+import logging  # noqa: E402
+
+from nodeble_api_server.state_reader import (  # noqa: E402
+    _reset_stale_warning_state,
+    check_stale_capital_used,
+)
+
+
+def _fixed_now_epoch() -> float:
+    """Friday 2026-04-22 18:00 UTC in epoch seconds — gives us a stable
+    anchor so staleness arithmetic is reproducible."""
+    from datetime import datetime, timezone
+    return datetime(2026, 4, 22, 18, 0, 0, tzinfo=timezone.utc).timestamp()
+
+
+def test_check_stale_fresh_timestamp_no_warn(caplog):
+    _reset_stale_warning_state()
+    now = _fixed_now_epoch()
+    # 1h fresh.
+    positions = [
+        {
+            "status": "open",
+            "spread_id": "fresh-1",
+            "capital_used": 1000.0,
+            "capital_used_as_of": "2026-04-22T17:00:00+00:00",
+        },
+    ]
+    with caplog.at_level(logging.WARNING, logger="nodeble_api_server.state_reader"):
+        count = check_stale_capital_used("wheel", positions, now_epoch=now)
+    assert count == 0
+    assert not any("capital_used stale" in rec.message for rec in caplog.records)
+
+
+def test_check_stale_25h_old_warns_with_age(caplog):
+    _reset_stale_warning_state()
+    now = _fixed_now_epoch()
+    # 25h stale.
+    positions = [
+        {
+            "status": "open",
+            "spread_id": "stale-1",
+            "capital_used": 1000.0,
+            "capital_used_as_of": "2026-04-21T17:00:00+00:00",
+        },
+    ]
+    with caplog.at_level(logging.WARNING, logger="nodeble_api_server.state_reader"):
+        count = check_stale_capital_used("wheel", positions, now_epoch=now)
+    assert count == 1
+    msgs = [rec.getMessage() for rec in caplog.records]
+    assert any("capital_used stale" in m for m in msgs)
+    assert any("stale-1" in m for m in msgs)
+    assert any("25.0h" in m or "25h" in m for m in msgs)
+
+
+def test_check_stale_missing_field_silent(caplog):
+    """During Phase 1-3 rollout, positions legitimately lack
+    capital_used_as_of. Must not flood logs on absence."""
+    _reset_stale_warning_state()
+    now = _fixed_now_epoch()
+    positions = [
+        {"status": "open", "spread_id": "pre-arch-12", "max_risk": 500, "contracts": 2},
+    ]
+    with caplog.at_level(logging.WARNING, logger="nodeble_api_server.state_reader"):
+        count = check_stale_capital_used("ic", positions, now_epoch=now)
+    assert count == 0
+    assert len(caplog.records) == 0
+
+
+def test_check_stale_malformed_timestamp_warns(caplog):
+    """Malformed timestamp is a schema contract violation — still
+    surfaces, with a distinct 'malformed' reason vs stale-age."""
+    _reset_stale_warning_state()
+    now = _fixed_now_epoch()
+    positions = [
+        {
+            "status": "open",
+            "spread_id": "bad-ts",
+            "capital_used": 1000.0,
+            "capital_used_as_of": "not-a-real-iso-string",
+        },
+    ]
+    with caplog.at_level(logging.WARNING, logger="nodeble_api_server.state_reader"):
+        count = check_stale_capital_used("strangle", positions, now_epoch=now)
+    assert count == 1
+    msgs = [rec.getMessage() for rec in caplog.records]
+    assert any("malformed" in m for m in msgs)
+    assert any("bad-ts" in m for m in msgs)
+
+
+def test_check_stale_closed_positions_skipped(caplog):
+    _reset_stale_warning_state()
+    now = _fixed_now_epoch()
+    positions = [
+        {
+            "status": "closed_profit",  # filtered by active-status check
+            "spread_id": "old-closed",
+            "capital_used": 1000.0,
+            "capital_used_as_of": "2026-04-01T00:00:00+00:00",  # 3 weeks old, would warn if open
+        },
+    ]
+    with caplog.at_level(logging.WARNING, logger="nodeble_api_server.state_reader"):
+        count = check_stale_capital_used("wheel", positions, now_epoch=now)
+    assert count == 0
+    assert len(caplog.records) == 0
+
+
+def test_check_stale_dedupes_within_cooldown(caplog):
+    """Same (strategy, position) warned twice within 1h → only one log.
+    Dashboard polling at ~5s cadence must not flood journald."""
+    _reset_stale_warning_state()
+    now = _fixed_now_epoch()
+    positions = [
+        {
+            "status": "open",
+            "spread_id": "flap-1",
+            "capital_used": 1000.0,
+            "capital_used_as_of": "2026-04-21T00:00:00+00:00",  # way stale
+        },
+    ]
+    with caplog.at_level(logging.WARNING, logger="nodeble_api_server.state_reader"):
+        check_stale_capital_used("wheel", positions, now_epoch=now)
+        # Same call 5 seconds later — must not re-warn.
+        check_stale_capital_used("wheel", positions, now_epoch=now + 5)
+        check_stale_capital_used("wheel", positions, now_epoch=now + 60)
+
+    stale_msgs = [r for r in caplog.records if "capital_used stale" in r.getMessage()]
+    assert len(stale_msgs) == 1
+
+
+def test_check_stale_dedup_expires_after_cooldown(caplog):
+    _reset_stale_warning_state()
+    now = _fixed_now_epoch()
+    positions = [
+        {
+            "status": "open",
+            "spread_id": "flap-2",
+            "capital_used": 1000.0,
+            "capital_used_as_of": "2026-04-21T00:00:00+00:00",
+        },
+    ]
+    with caplog.at_level(logging.WARNING, logger="nodeble_api_server.state_reader"):
+        check_stale_capital_used("wheel", positions, now_epoch=now)
+        # 2h later — cooldown elapsed, should warn again.
+        check_stale_capital_used("wheel", positions, now_epoch=now + 2 * 3600)
+
+    stale_msgs = [r for r in caplog.records if "capital_used stale" in r.getMessage()]
+    assert len(stale_msgs) == 2
+
+
+def test_check_stale_dedup_is_per_position_not_global(caplog):
+    """Two stale positions on the same strategy both warn independently."""
+    _reset_stale_warning_state()
+    now = _fixed_now_epoch()
+    positions = [
+        {
+            "status": "open",
+            "spread_id": "p1",
+            "capital_used_as_of": "2026-04-21T00:00:00+00:00",
+        },
+        {
+            "status": "open",
+            "spread_id": "p2",
+            "capital_used_as_of": "2026-04-21T00:00:00+00:00",
+        },
+    ]
+    with caplog.at_level(logging.WARNING, logger="nodeble_api_server.state_reader"):
+        check_stale_capital_used("wheel", positions, now_epoch=now)
+
+    stale_msgs = [r for r in caplog.records if "capital_used stale" in r.getMessage()]
+    assert len(stale_msgs) == 2
+
+
 # ── Health ──────────────────────────────────────────────────────────────────
 
 def test_health_critical_when_scan_missing():
