@@ -8,6 +8,10 @@ from pathlib import Path
 from nodeble_api_server.shims._whitelist_shim import run_shim
 
 _WHITELIST = {
+    # Kill-switch knob — shim-writable so the /system/killswitch endpoint
+    # can flip it; the /config/editable-paths route hides it from the UI's
+    # generic ✎ editor so users only flip via the dedicated killswitch modal.
+    "mode": {"type": "str", "choices": ["live", "dry_run"]},
     # Selection — deltas
     "selection.delta_target": {"type": "float", "min": 0.01, "max": 0.5},
     "selection.delta_min": {"type": "float", "min": 0.01, "max": 0.5},

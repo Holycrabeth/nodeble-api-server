@@ -113,6 +113,15 @@ def _resolve_shim(strategy_id: str) -> tuple[str, str]:
     return shim, str(venv)
 
 
+# Parameters the shim whitelists but the UI must NOT expose as a
+# generic editable row. These have dedicated system endpoints that
+# write them (killswitch for `mode`); letting the Config tab ✎ them
+# directly would create two paths to flip the same knob with different
+# audit semantics, and the UI-editor path would bypass the confirmation
+# modal + reason-capture that dedicated endpoints enforce.
+HIDDEN_FROM_CONFIG_EDITOR: frozenset[str] = frozenset({"mode"})
+
+
 @router.get("/{strategy_id}/config/editable-paths")
 def editable_paths(strategy_id: str) -> dict:
     """Return the dotted config paths the UI is allowed to edit for this
@@ -121,7 +130,10 @@ def editable_paths(strategy_id: str) -> dict:
 
     Implementation delegates to the shim's `list` action — each family
     knows its own whitelist (Group A reads yaml_path from *_PARAMS; B/C/D
-    read the keys of our own whitelist dict)."""
+    read the keys of our own whitelist dict). We then filter out paths
+    in HIDDEN_FROM_CONFIG_EDITOR: `mode` is shim-writable (killswitch
+    needs the setter path) but must not surface as a ✎ row.
+    """
     shim_name, venv_python = _resolve_shim(strategy_id)
     result = run_shim(
         venv_python=venv_python,  # type: ignore[arg-type]
@@ -133,7 +145,8 @@ def editable_paths(strategy_id: str) -> dict:
     )
     if not result.ok:
         raise HTTPException(status_code=500, detail=result.error or "list failed")
-    paths = result.new if isinstance(result.new, list) else []
+    paths_raw = result.new if isinstance(result.new, list) else []
+    paths = [p for p in paths_raw if p not in HIDDEN_FROM_CONFIG_EDITOR]
     return {"editable_paths": paths}
 
 

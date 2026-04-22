@@ -9,6 +9,8 @@ from pathlib import Path
 from nodeble_api_server.shims._whitelist_shim import run_shim
 
 _WHITELIST = {
+    # Kill-switch knob — shim-writable, UI hides it (see strangle.py comment).
+    "mode": {"type": "str", "choices": ["live", "dry_run"]},
     # Body / wing delta ranges
     "selection.body_delta_min": {"type": "float", "min": 0.1, "max": 0.7},
     "selection.body_delta_max": {"type": "float", "min": 0.1, "max": 0.7},

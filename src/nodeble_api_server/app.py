@@ -96,7 +96,9 @@ app.include_router(api_v1)
 # Strategy-scoped routes live in their own module for clarity.
 from nodeble_api_server.routes import strategies as _strategies  # noqa: E402
 from nodeble_api_server.routes import market as _market  # noqa: E402
+from nodeble_api_server.routes import system as _system  # noqa: E402
 
 app.include_router(_strategies.router)
 app.include_router(_market.router)
+app.include_router(_system.router)
 app.include_router(ws.router)
