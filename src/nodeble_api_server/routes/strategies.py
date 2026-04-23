@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from nodeble_api_server.actions import run_strategy_scan
 from nodeble_api_server.audit import audit_path, write_event
 from nodeble_api_server.audit_reader import read_audit_entries
 from nodeble_api_server.auth import require_bearer_token
@@ -480,3 +481,127 @@ def get_logs(
         # missing file, still 200 so UI stays consistent.
         return {"lines": [], "cursor": 0, "truncated": False}
     return tail_bytes(path, cursor, limit)
+
+
+# ── Manual actions (M3.a): on-demand scan ───────────────────────────────────
+
+
+class ScanActionRequest(BaseModel):
+    """POST /strategies/{id}/actions/scan body.
+
+    `mode`:
+      - "dry_run" (MVP default): always passes `--dry-run` to the CLI.
+        Safe to click — strategy computes candidates, prints decisions,
+        doesn't hit the broker for placing orders.
+      - "live": omits `--dry-run`. Subject to the strategy's yaml.mode.
+        Requires `confirm=True` and a non-empty `reason` so accidental
+        clicks can't fire live trades. (Enforced at route level, not
+        the actions.py layer, so the core path stays simple.)
+
+    `force=True` by default because a human pressed a button — they
+    want it to run NOW, not skip because of a cron-gate like
+    market-closed-time.
+
+    `reason` is a short free-form string the operator types in the
+    modal ("checking after Fed announcement", "verifying fix" etc.).
+    Ends up in audit.jsonl alongside the request.
+    """
+    mode: str = Field("dry_run", pattern="^(dry_run|live)$")
+    force: bool = True
+    confirm: bool = False
+    reason: str = Field("", max_length=500)
+
+
+@router.post("/{strategy_id}/actions/scan")
+def trigger_scan(strategy_id: str, payload: ScanActionRequest) -> dict:
+    """Run `python -m <strategy-pkg> --mode scan [--dry-run] [--force]`
+    once, right now, on the strategy's own venv. Returns stdout/stderr
+    tails + duration + exit code so the operator sees what happened.
+
+    Gates:
+    - Unknown strategy_id → 404
+    - mode="live" without confirm=True or empty reason → 400
+      (we don't want a client bug or mis-typed body firing a live scan;
+      the desktop modal makes the operator type "LIVE SCAN" to set both)
+
+    Audit: one entry with param_path="actions.scan", new_value carries
+    the request + result summary. Reuses the existing audit schema
+    rather than inventing a parallel action log — simpler reader code,
+    single time-ordered trail.
+    """
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+
+    if payload.mode == "live":
+        if not payload.confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="live scan requires confirm=true",
+            )
+        if not payload.reason.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="live scan requires a non-empty reason",
+            )
+
+    # Dispatch to actions.py — the heavy lifting (subprocess, timeout,
+    # stdout capture, cache invalidation) lives there so this route stays
+    # focused on HTTP concerns.
+    result = run_strategy_scan(
+        strategy_id,
+        mode=payload.mode,
+        force=payload.force,
+    )
+
+    # Audit the action. The schema is config-centric (param_path / old /
+    # new) but carries actions cleanly: param_path namespaces the action
+    # type, new_value packs request + result summary. Kept old_value=None
+    # to distinguish from config edits.
+    audit_new_value = {
+        "request": {
+            "mode": payload.mode,
+            "force": payload.force,
+        },
+        "result": {
+            "status": result.status,
+            "exit_code": result.exit_code,
+            "duration_ms": result.duration_ms,
+        },
+    }
+    try:
+        write_event(
+            strategy=strategy_id,
+            param_path="actions.scan",
+            old_value=None,
+            new_value=audit_new_value,
+            reason=payload.reason.strip() or "manual scan",
+            result=result.status,
+            error=result.error,
+        )
+    except OSError as e:
+        # Audit write is best-effort for actions — losing the audit
+        # record is worse than dropping the response, so we log the
+        # error via the result and still return. (Config edits treat
+        # audit failure as fatal because the change landed; a scan
+        # producing decisions is transient — next scan re-derives.)
+        result = ScanResult_with_audit_warn(result, f"audit write failed: {e}")
+
+    return asdict(result)
+
+
+def ScanResult_with_audit_warn(result, warn: str):
+    """Append an audit warning to the error field without losing the
+    original error. Separate helper so the happy path stays readable."""
+    from nodeble_api_server.actions import ScanResult
+    combined = result.error or ""
+    combined = f"{combined}; {warn}" if combined else warn
+    return ScanResult(
+        status=result.status,
+        exit_code=result.exit_code,
+        duration_ms=result.duration_ms,
+        stdout_tail=result.stdout_tail,
+        stderr_tail=result.stderr_tail,
+        started_at=result.started_at,
+        completed_at=result.completed_at,
+        error=combined,
+    )
