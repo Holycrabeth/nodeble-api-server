@@ -502,7 +502,12 @@ def build_strategy_card(strategy_id: str, home: Path | None = None) -> dict:
     state_scan = normalize_timestamp(state.get("last_scan_date"))
     state_manage = normalize_timestamp(state.get("last_manage_date"))
     state_signal = read_signal_timestamp(strategy_id, home=home)
-    health = compute_health(state_scan, state_manage, state_signal)
+    health = compute_health(
+        state_scan,
+        state_manage,
+        state_signal,
+        open_positions=open_positions,
+    )
 
     log_mtime = None
     if not (state_scan and state_manage and state_signal):
@@ -511,10 +516,20 @@ def build_strategy_card(strategy_id: str, home: Path | None = None) -> dict:
     last_manage_at = state_manage or log_mtime
     last_signal_at = state_signal or log_mtime
 
+    # Expose `mode` on the card so the Market page + future UI can show
+    # live / dry_run next to health without refetching the full config.
+    # Falls back to "live" when the field is missing (pre-ARCH-12 yaml
+    # shape — all 9 strategies have it now but keep the default so a
+    # tampered yaml doesn't crash the card fan-out).
+    mode = config.get("mode")
+    if not isinstance(mode, str):
+        mode = "live"
+
     return {
         "id": strategy_id,
         "name": meta["name"],
         "enabled": enabled,
+        "mode": mode,
         "open_positions": open_positions,
         "budget_used": budget_used,
         "budget_max": budget_max,
@@ -535,13 +550,29 @@ def compute_health(
     last_manage_at: str | None,
     last_signal_at: str | None,
     now: datetime | None = None,
+    *,
+    open_positions: int = 0,
 ) -> str:
     """Health tier:
-    - critical: last_scan_at or last_manage_at missing/unparseable
-    - warning:  any of the three is > 24h old
+    - critical: last_scan_at missing/unparseable, OR
+                last_manage_at missing AND open_positions > 0
+    - warning:  any of the three present timestamps is > 24h old
     - healthy:  otherwise
+
+    The open_positions gate matters for strategies whose manage cron
+    SKIPS writing last_manage_date when there's nothing to manage —
+    IronButterfly / Calendar / Straddle in their current dry-run-0-
+    position baseline write last_scan_date but no last_manage_date
+    because the "manage" mode exits early with no work. Those
+    strategies are operationally healthy; flagging them critical
+    alarmed operators who then had to remember it was expected.
+
+    Strategies WITH open positions still get critical on missing
+    manage — a missing manage cron on a live book is real negligence.
     """
-    if not last_scan_at or not last_manage_at:
+    if not last_scan_at:
+        return "critical"
+    if not last_manage_at and open_positions > 0:
         return "critical"
     if now is None:
         now = datetime.now(SERVER_TZ)

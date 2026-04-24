@@ -497,8 +497,51 @@ def test_health_critical_when_scan_missing():
     assert compute_health(None, "2026-04-19T10:00:00-04:00", None) == "critical"
 
 
-def test_health_critical_when_manage_missing():
-    assert compute_health("2026-04-19T10:00:00-04:00", None, None) == "critical"
+def test_health_critical_when_manage_missing_and_positions_open():
+    """Active book without a manage timestamp is real negligence — scan
+    alone proves cron is firing but something's dropping the manage leg.
+    Keep as critical so the operator sees it in red."""
+    assert (
+        compute_health(
+            "2026-04-19T10:00:00-04:00",
+            None,
+            None,
+            open_positions=3,
+        )
+        == "critical"
+    )
+
+
+def test_health_healthy_when_manage_missing_but_no_open_positions():
+    """Regression fix: IronButterfly / Calendar / Straddle in their
+    dry_run + 0 positions baseline skip writing last_manage_date because
+    the manage mode exits early when there's nothing to manage. That's
+    expected behavior — flagging them critical for NOT writing a
+    no-op-manage timestamp created false alarms every cron tick. Heal
+    to healthy when open_positions==0."""
+    now = datetime.now(SERVER_TZ)
+    recent_scan = now.isoformat()
+    assert (
+        compute_health(
+            recent_scan,
+            None,          # manage never wrote — strategy has no work
+            recent_scan,   # signal still recent
+            now=now,
+            open_positions=0,
+        )
+        == "healthy"
+    )
+
+
+def test_health_critical_when_manage_missing_default_zero_positions():
+    """Default open_positions=0 preserves old behavior for ambiguous
+    callers: a manage timestamp that's missing with 0 known positions
+    is healthy. Ensures explicit callsite wiring isn't accidentally
+    broken by default-arg drift."""
+    now = datetime.now(SERVER_TZ)
+    recent = now.isoformat()
+    # Kwargs omitted on purpose — explicit healthy via default gate.
+    assert compute_health(recent, None, recent, now=now) == "healthy"
 
 
 def test_health_healthy_recent():

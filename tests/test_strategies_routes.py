@@ -132,6 +132,7 @@ def test_list_strategies_card_fields(client):
     ic = next(s for s in r["strategies"] if s["id"] == "ic")
     assert ic["name"] == "Iron Condor"
     assert ic["enabled"] is True
+    assert ic["mode"] == "live"         # NEW — exposed for Market page compound status
     assert ic["open_positions"] == 2
     assert ic["budget_used"] == 30000.0  # (100+200) * 1 * 100
     assert ic["budget_max"] == 5000      # from allocation.json
