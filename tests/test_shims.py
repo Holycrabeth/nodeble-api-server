@@ -274,3 +274,74 @@ def test_whitelist_shim_rejects_unknown_path(tmp_path, monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["ok"] is False
     assert "whitelist" in payload["error"]
+
+
+# ── Calendar shim coverage ────────────────────────────────────────────────
+#
+# We keep calendar's specific whitelist tests here (rather than a
+# dedicated test_shim_calendar.py) because the driver is the shared
+# `_whitelist_shim.run_shim` — these tests exist to prove the
+# per-strategy whitelist dict in shims/calendar.py has the entries the
+# UI's config editor expects. Every time a new field is exposed to the
+# UI, add a matching case here.
+
+
+def test_calendar_shim_sets_sizing_contracts_per_100k(
+    tmp_path, monkeypatch, capsys,
+):
+    """Batch-2 UX Polish follow-up: calendar was showing
+    `sizing.contracts_per_100k` as read-only in the config editor
+    because the shim's whitelist was missing the entry. This test
+    pins the new entry into the contract so a future whitelist
+    refactor can't silently drop it again."""
+    from nodeble_api_server.shims import _whitelist_shim
+    from nodeble_api_server.shims.calendar import _WHITELIST as calendar_whitelist
+
+    # Contract pin: the field IS in the whitelist with int bounds.
+    assert "sizing.contracts_per_100k" in calendar_whitelist
+    entry = calendar_whitelist["sizing.contracts_per_100k"]
+    assert entry["type"] == "int"
+    assert entry["min"] == 1 and entry["max"] == 50
+
+    strategy_dir = tmp_path / ".nodeble-calendar"
+    (strategy_dir / "config").mkdir(parents=True)
+    yaml_path = strategy_dir / "config" / "strategy.yaml"
+    yaml_path.write_text("sizing:\n  contracts_per_100k: 3\n  other: 5\n")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "set", "calendar", "sizing.contracts_per_100k", "7"],
+    )
+    with pytest.raises(SystemExit):
+        _whitelist_shim.run_shim("calendar", strategy_dir, calendar_whitelist)
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload == {"ok": True, "old": 3, "new": 7, "error": None}
+
+    # Sibling key `other` must survive — set_by_path preserves siblings.
+    reloaded = read_yaml(yaml_path)
+    assert reloaded["sizing"] == {"contracts_per_100k": 7, "other": 5}
+
+
+def test_calendar_shim_rejects_sizing_contracts_per_100k_above_max(
+    tmp_path, monkeypatch, capsys,
+):
+    """Bounds check: 100 > max (50) must fail validation with a clear
+    error, not silently write nonsense."""
+    from nodeble_api_server.shims import _whitelist_shim
+    from nodeble_api_server.shims.calendar import _WHITELIST as calendar_whitelist
+
+    strategy_dir = tmp_path / ".nodeble-calendar"
+    (strategy_dir / "config").mkdir(parents=True)
+    (strategy_dir / "config" / "strategy.yaml").write_text(
+        "sizing:\n  contracts_per_100k: 3\n",
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "validate", "calendar", "sizing.contracts_per_100k", "100"],
+    )
+    with pytest.raises(SystemExit):
+        _whitelist_shim.run_shim("calendar", strategy_dir, calendar_whitelist)
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["ok"] is False
+    assert "above max" in payload["error"]

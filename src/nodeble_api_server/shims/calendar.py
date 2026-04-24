@@ -19,6 +19,12 @@ _WHITELIST = {
     "selection.max_spread_pct": {"type": "float", "min": 0.01, "max": 0.5},
     "selection.min_debit": {"type": "float", "min": 0.1, "max": 100.0},
     "selection.max_debit_pct_of_underlying": {"type": "float", "min": 0.001, "max": 0.5},
+    # Position sizing — exposed to the UI so operators can tune risk
+    # per $100k of deployable NLV without SSHing to rewrite yaml.
+    # Calendar's own SETTABLE_PARAMS already covers this; we were
+    # previously missing the whitelist entry, so the config editor
+    # showed "不支持通过 UI 编辑此参数" incorrectly.
+    "sizing.contracts_per_100k": {"type": "int", "min": 1, "max": 50},
 }
 
 
