@@ -601,3 +601,145 @@ def test_latest_log_mtime_returns_newest(tmp_path):
 def test_latest_log_mtime_no_logs_returns_none(tmp_path):
     (tmp_path / ".nodeble" / "logs").mkdir(parents=True)
     assert latest_log_mtime("ic", home=tmp_path) is None
+
+
+# ── _compute_pnl_fields (StrategyCard 3-field populate) ─────────────────────
+#
+# UI Director audit follow-up 2026-04-26: the three PnL summary
+# fields on StrategyCard (today_pnl / cumulative_pnl_7d /
+# cumulative_pnl_30d) were declared but hardcoded None in
+# build_strategy_card. These tests pin the new compute path:
+#   - empty history file → all None
+#   - today's snapshot present + cumulative motion → today_pnl
+#     surfaces the latest delta, 7d/30d sum non-null deltas
+#   - all-null cumulative (e.g. brand-new strategy that hasn't
+#     traded yet) → all None preserved (don't fake a "$0 today")
+
+
+def _seed_pnl_history(home: Path, strategy: str, rows: list[dict]) -> Path:
+    """Helper: write daily-pnl.jsonl under tmp home with the given rows.
+    Returns the resolved path so tests can also negative-assert on
+    file presence if they want."""
+    history_path = home / ".nodeble-api" / "history" / "daily-pnl.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(history_path, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    return history_path
+
+
+def test_compute_pnl_fields_no_history_file(tmp_path):
+    # No daily-pnl.jsonl ever written (fresh install pre-snapshot).
+    # All three fields must be None — UI tile shows "—" rather than
+    # a stale or invented "$0".
+    fields = state_reader._compute_pnl_fields("ic", home=tmp_path)
+    assert fields == {
+        "today_pnl": None,
+        "cumulative_pnl_7d": None,
+        "cumulative_pnl_30d": None,
+    }
+
+
+def test_compute_pnl_fields_today_snapshot_with_motion(tmp_path):
+    # Two days of snapshots, the second on TODAY (ET). The latest
+    # row's daily_delta becomes today_pnl; 7d/30d sum the non-null
+    # deltas (here just the second entry's delta).
+    today = datetime.now(SERVER_TZ).date()
+    yesterday = today - timedelta(days=1)
+    _seed_pnl_history(
+        tmp_path,
+        "ic",
+        [
+            {
+                "date": yesterday.isoformat(),
+                "snapshot_at": f"{yesterday.isoformat()}T23:59:00-04:00",
+                "strategy": "ic",
+                "realized_pnl_cumulative": 100.0,
+                "open_positions_count": 2,
+            },
+            {
+                "date": today.isoformat(),
+                "snapshot_at": f"{today.isoformat()}T23:59:00-04:00",
+                "strategy": "ic",
+                "realized_pnl_cumulative": 250.0,
+                "open_positions_count": 2,
+            },
+        ],
+    )
+
+    fields = state_reader._compute_pnl_fields("ic", home=tmp_path)
+    # First row's delta = None (no prior); second row's delta = 150.
+    # today matches → today_pnl = 150.
+    assert fields["today_pnl"] == 150.0
+    # 7d / 30d windows include only the non-None deltas → 150.
+    assert fields["cumulative_pnl_7d"] == 150.0
+    assert fields["cumulative_pnl_30d"] == 150.0
+
+
+def test_compute_pnl_fields_latest_not_today_returns_none_today(tmp_path):
+    # Today is e.g. 2026-04-24; latest snapshot is 2026-04-22 (no
+    # 23:59 ET tick has fired since). today_pnl must be None — yesterday's
+    # delta isn't today's. 7d / 30d still aggregate what's there.
+    today = datetime.now(SERVER_TZ).date()
+    two_days_ago = today - timedelta(days=2)
+    three_days_ago = today - timedelta(days=3)
+    _seed_pnl_history(
+        tmp_path,
+        "wheel",
+        [
+            {
+                "date": three_days_ago.isoformat(),
+                "snapshot_at": f"{three_days_ago.isoformat()}T23:59:00-04:00",
+                "strategy": "wheel",
+                "realized_pnl_cumulative": 8000.0,
+                "open_positions_count": 5,
+            },
+            {
+                "date": two_days_ago.isoformat(),
+                "snapshot_at": f"{two_days_ago.isoformat()}T23:59:00-04:00",
+                "strategy": "wheel",
+                "realized_pnl_cumulative": 9200.0,
+                "open_positions_count": 5,
+            },
+        ],
+    )
+
+    fields = state_reader._compute_pnl_fields("wheel", home=tmp_path)
+    assert fields["today_pnl"] is None
+    # Window deltas: row 0 None (first row), row 1 = 1200. Sum = 1200.
+    assert fields["cumulative_pnl_7d"] == 1200.0
+    assert fields["cumulative_pnl_30d"] == 1200.0
+
+
+def test_compute_pnl_fields_all_null_cumulative_returns_all_none(tmp_path):
+    # Edge case: strategy enrolled in snapshot loop but its state.json
+    # never had a realized_pnl_cumulative (newly installed strategy
+    # that hasn't traded). Every entry's daily_delta is None → no
+    # window sum can be computed → all three fields stay None.
+    today = datetime.now(SERVER_TZ).date()
+    yesterday = today - timedelta(days=1)
+    _seed_pnl_history(
+        tmp_path,
+        "calendar",
+        [
+            {
+                "date": yesterday.isoformat(),
+                "snapshot_at": f"{yesterday.isoformat()}T23:59:00-04:00",
+                "strategy": "calendar",
+                "realized_pnl_cumulative": None,
+                "open_positions_count": 0,
+            },
+            {
+                "date": today.isoformat(),
+                "snapshot_at": f"{today.isoformat()}T23:59:00-04:00",
+                "strategy": "calendar",
+                "realized_pnl_cumulative": None,
+                "open_positions_count": 0,
+            },
+        ],
+    )
+
+    fields = state_reader._compute_pnl_fields("calendar", home=tmp_path)
+    assert fields["today_pnl"] is None
+    assert fields["cumulative_pnl_7d"] is None
+    assert fields["cumulative_pnl_30d"] is None

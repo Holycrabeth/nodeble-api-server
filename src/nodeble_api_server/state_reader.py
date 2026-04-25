@@ -525,6 +525,8 @@ def build_strategy_card(strategy_id: str, home: Path | None = None) -> dict:
     if not isinstance(mode, str):
         mode = "live"
 
+    pnl_fields = _compute_pnl_fields(strategy_id, home=home)
+
     return {
         "id": strategy_id,
         "name": meta["name"],
@@ -538,10 +540,87 @@ def build_strategy_card(strategy_id: str, home: Path | None = None) -> dict:
         "last_manage_at": last_manage_at,
         "health": health,
         "version": None,
-        "today_pnl": None,
-        "cumulative_pnl_7d": None,
-        "cumulative_pnl_30d": None,
+        "today_pnl": pnl_fields["today_pnl"],
+        "cumulative_pnl_7d": pnl_fields["cumulative_pnl_7d"],
+        "cumulative_pnl_30d": pnl_fields["cumulative_pnl_30d"],
         "circuit_breaker": None,
+    }
+
+
+# ── PnL summary fields (Dashboard tile + Market page) ──────────────────────
+#
+# UI Director audit follow-up 2026-04-26: StrategyCard's three PnL
+# fields (today_pnl / cumulative_pnl_7d / cumulative_pnl_30d) were
+# declared on the TS side but hardcoded to None here. Frontend PR α
+# (d711702) shipped Dashboard cards that render these — without this
+# fix every customer sees "—" everywhere and assumes the new feature
+# is broken.
+#
+# Path resolution is inlined (rather than imported from
+# `snapshot_writer.snapshot_path`) because snapshot_writer already
+# imports from state_reader — pulling the other direction would close
+# the cycle. Single duplication of the path string is the lesser evil.
+
+
+def _pnl_history_path(home: Path | None = None) -> Path:
+    """Resolve `~/.nodeble-api/history/daily-pnl.jsonl`. Mirrors the
+    canonical path in snapshot_writer; inlined to avoid a circular
+    import (snapshot_writer→state_reader already exists)."""
+    base = home if home is not None else Path.home()
+    return base / ".nodeble-api" / "history" / "daily-pnl.jsonl"
+
+
+def _compute_pnl_fields(
+    strategy_id: str,
+    home: Path | None = None,
+) -> dict:
+    """Today / 7-day / 30-day realized PnL summary for one strategy.
+
+    Reads the daily-pnl.jsonl snapshot history (the same file
+    /history/pnl serves), filters by strategy, and computes:
+
+      - today_pnl: daily_delta of the latest entry ONLY if its date
+        equals today's ET date. Yesterday's number isn't "today's
+        P&L" — return None so the UI shows "—" rather than a
+        stale-but-real-looking dollar figure.
+      - cumulative_pnl_7d:  sum of daily_delta over the last 7 entries
+      - cumulative_pnl_30d: sum over the last 30 entries
+
+    None deltas (first entry, or entries with null cumulative) are
+    skipped from the sum. Window with zero non-None deltas → field is
+    None (preserves the "no data" vs "computed zero" distinction the
+    UI tile relies on).
+    """
+    # Lazy import: history_reader doesn't import state_reader today,
+    # but the lazy form keeps state_reader's top-of-file import surface
+    # focused on its own concerns.
+    from nodeble_api_server.history_reader import read_pnl_entries
+
+    path = _pnl_history_path(home=home)
+    entries = read_pnl_entries(path, strategy_id)
+    if not entries:
+        return {
+            "today_pnl": None,
+            "cumulative_pnl_7d": None,
+            "cumulative_pnl_30d": None,
+        }
+
+    today_iso = datetime.now(SERVER_TZ).date().isoformat()
+    latest = entries[-1]
+    today_pnl = (
+        latest.get("daily_delta") if latest.get("date") == today_iso else None
+    )
+
+    def _sum_or_none(window: list[dict]) -> float | None:
+        non_null = [
+            e["daily_delta"] for e in window if e.get("daily_delta") is not None
+        ]
+        return sum(non_null) if non_null else None
+
+    return {
+        "today_pnl": today_pnl,
+        "cumulative_pnl_7d": _sum_or_none(entries[-7:]),
+        "cumulative_pnl_30d": _sum_or_none(entries[-30:]),
     }
 
 
