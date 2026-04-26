@@ -184,6 +184,107 @@ def read_state(strategy_id: str, home: Path | None = None) -> dict | None:
     return _cached(("state", strategy_id, str(path)), lambda: _read_json(path))
 
 
+# ── Halt status (audit-26 spec §2) ──────────────────────────────────────────
+#
+# Each strategy module reads ~/.<folder>/STOP at cron startup; if present,
+# the module halts (no new positions, no manage actions). UI was previously
+# blind to halt state — the bot looked silently stopped to customers.
+# These helpers expose halt state to api-server so:
+#   - GET /api/v1/strategies (list) shows halted + halted_reason on cards
+#   - GET /api/v1/strategies/{id}/halted (detail) gives full content + mtime
+#     for M3.b /close race-protection re-verify (NOT cached path)
+#
+# IC's STOP file lives at ~/.nodeble/STOP (no -ic suffix, historical naming).
+# All other 8 strategies use ~/.nodeble-<module>/STOP. STRATEGY_REGISTRY
+# already encodes the folder mapping per strategy_id.
+
+_HALT_FALLBACK_REASON = "系统检测到异常,请联系管理员"
+
+
+def read_halt_summary(strategy_id: str, home: Path | None = None) -> dict:
+    """Return 2-field halt summary for /api/v1/strategies list endpoint.
+
+    Cached via _cached (5s TTL) since this fans out across 9 strategies in
+    one request. Cache TTL matches existing state-read cache so STOP file
+    changes propagate to UI within ~5 seconds.
+
+    Returns: {"halted": bool, "halted_reason": str | None}
+    """
+    home = home or Path.home()
+    meta = STRATEGY_REGISTRY.get(strategy_id)
+    if not meta:
+        return {"halted": False, "halted_reason": None}
+    path = home / meta["folder"] / "STOP"
+
+    def loader() -> dict:
+        if not path.exists():
+            return {"halted": False, "halted_reason": None}
+        try:
+            content = path.read_text().strip()
+            first_line = content.split("\n")[0].strip() if content else ""
+            return {
+                "halted": True,
+                "halted_reason": first_line if first_line else _HALT_FALLBACK_REASON,
+            }
+        except Exception as exc:
+            logger.warning(
+                "Failed to read STOP file for %s at %s: %s — treating as halted",
+                strategy_id, path, exc,
+            )
+            return {"halted": True, "halted_reason": _HALT_FALLBACK_REASON}
+
+    return _cached(("halt_summary", strategy_id, str(path)), loader)
+
+
+def read_halt_detail(strategy_id: str, home: Path | None = None) -> dict:
+    """Return 4-field halt detail for /api/v1/strategies/{id}/halted endpoint.
+
+    NOT cached — caller (M3.b /close-preview, /close) re-verifies at request
+    time to close the race window between 5s list cache and Close button click.
+
+    Returns: {
+        "halted": bool,
+        "reason": str | None,           # first line of STOP file
+        "halted_at": str | None,        # ISO 8601 UTC mtime
+        "full_content": str | None,     # full STOP file content (for tooltip / debug)
+    }
+    """
+    home = home or Path.home()
+    empty = {"halted": False, "reason": None, "halted_at": None, "full_content": None}
+    meta = STRATEGY_REGISTRY.get(strategy_id)
+    if not meta:
+        return empty
+
+    path = home / meta["folder"] / "STOP"
+    if not path.exists():
+        return empty
+
+    try:
+        content = path.read_text().strip()
+        first_line = content.split("\n")[0].strip() if content else ""
+        reason = first_line if first_line else _HALT_FALLBACK_REASON
+        mtime_iso = datetime.fromtimestamp(
+            path.stat().st_mtime, tz=timezone.utc,
+        ).isoformat()
+        return {
+            "halted": True,
+            "reason": reason,
+            "halted_at": mtime_iso,
+            "full_content": content,
+        }
+    except Exception as exc:
+        logger.warning(
+            "Failed to read STOP detail for %s at %s: %s — treating as halted",
+            strategy_id, path, exc,
+        )
+        return {
+            "halted": True,
+            "reason": _HALT_FALLBACK_REASON,
+            "halted_at": None,
+            "full_content": None,
+        }
+
+
 def read_config(strategy_id: str, home: Path | None = None) -> dict | None:
     """Merge strategy.yaml + risk.yaml. strategy.yaml missing → None."""
     home = home or Path.home()
@@ -526,6 +627,7 @@ def build_strategy_card(strategy_id: str, home: Path | None = None) -> dict:
         mode = "live"
 
     pnl_fields = _compute_pnl_fields(strategy_id, home=home)
+    halt = read_halt_summary(strategy_id, home=home)
 
     return {
         "id": strategy_id,
@@ -543,6 +645,8 @@ def build_strategy_card(strategy_id: str, home: Path | None = None) -> dict:
         "today_pnl": pnl_fields["today_pnl"],
         "cumulative_pnl_7d": pnl_fields["cumulative_pnl_7d"],
         "cumulative_pnl_30d": pnl_fields["cumulative_pnl_30d"],
+        "halted": halt["halted"],
+        "halted_reason": halt["halted_reason"],
         "circuit_breaker": None,
     }
 

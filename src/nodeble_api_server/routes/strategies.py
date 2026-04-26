@@ -43,6 +43,7 @@ from nodeble_api_server.state_reader import (
     positions_as_list,
     read_allocation,
     read_config,
+    read_halt_detail,
     read_state,
     strategy_config_shim,
     strategy_log_path,
@@ -72,6 +73,24 @@ def get_strategy(strategy_id: str) -> dict:
     alloc_key = meta.get("allocation_key", strategy_id)
     card["allocation"] = (allocation.get("strategies") or {}).get(alloc_key)
     return card
+
+
+@router.get("/{strategy_id}/halted")
+def get_halt_status(strategy_id: str) -> dict:
+    """Per-strategy halt detail. Bypasses 5s list cache for race-protection.
+
+    Used by M3.b /close-preview + /close to re-verify halt state at request
+    time (closing the window between 5s list cache and customer Close click).
+
+    Returns 4 fields per audit-26 spec §2.2:
+        halted: bool
+        reason: str | None              # first line of STOP file content
+        halted_at: str | None           # ISO 8601 UTC mtime
+        full_content: str | None        # full STOP file body
+    """
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+    return read_halt_detail(strategy_id)
 
 
 @router.get("/{strategy_id}/positions")

@@ -255,3 +255,67 @@ def test_directionalspread_uses_cs_allocation_key(tmp_path, monkeypatch):
     r = c.get("/api/v1/strategies/directionalspread", headers=_auth()).json()
     assert r["allocation"]["max_buying_power"] == 7777
     assert r["budget_max"] == 7777
+
+
+# ── Halt status (audit-26 spec §2) ──────────────────────────────────────────
+
+
+def test_halted_endpoint_404_when_unknown_strategy(client):
+    """Unknown strategy_id → 404."""
+    r = client.get("/api/v1/strategies/does_not_exist/halted", headers=_auth())
+    assert r.status_code == 404
+
+
+def test_halted_endpoint_returns_false_default(client, fake_home):
+    """No STOP file → halted=False, all other fields None."""
+    r = client.get("/api/v1/strategies/wheel/halted", headers=_auth())
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {
+        "halted": False,
+        "reason": None,
+        "halted_at": None,
+        "full_content": None,
+    }
+
+
+def test_halted_endpoint_returns_full_detail_when_stop_present(client, fake_home):
+    """STOP file present → halted=True with reason + halted_at + full_content."""
+    (fake_home / ".nodeble-wheel" / "STOP").write_text(
+        "Reconcile drift detected\nUNCLASSIFIED: SPY 260430C690"
+    )
+    # Bust the cache so the new file is picked up immediately.
+    state_reader.clear_cache()
+    r = client.get("/api/v1/strategies/wheel/halted", headers=_auth())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["halted"] is True
+    assert body["reason"] == "Reconcile drift detected"
+    assert body["full_content"] == "Reconcile drift detected\nUNCLASSIFIED: SPY 260430C690"
+    assert body["halted_at"] is not None
+
+
+def test_list_strategies_includes_halted_fields(client, fake_home):
+    """List endpoint cards include halted + halted_reason fields per audit-26 §2.1."""
+    r = client.get("/api/v1/strategies", headers=_auth())
+    assert r.status_code == 200
+    body = r.json()
+    cards = body["strategies"]
+    assert len(cards) >= 1
+    for card in cards:
+        assert "halted" in card
+        assert "halted_reason" in card
+        # Default no STOP files in fake_home → both False / None
+        assert card["halted"] is False
+        assert card["halted_reason"] is None
+
+
+def test_list_strategies_surfaces_halted_card_when_stop_present(client, fake_home):
+    """List endpoint reflects STOP file presence within 5s cache window."""
+    (fake_home / ".nodeble-wheel" / "STOP").write_text("Operator manual halt")
+    state_reader.clear_cache()
+    r = client.get("/api/v1/strategies", headers=_auth())
+    assert r.status_code == 200
+    cards = {c["id"]: c for c in r.json()["strategies"]}
+    assert cards["wheel"]["halted"] is True
+    assert cards["wheel"]["halted_reason"] == "Operator manual halt"

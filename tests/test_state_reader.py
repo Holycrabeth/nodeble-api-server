@@ -21,6 +21,8 @@ from nodeble_api_server.state_reader import (
     positions_as_list,
     read_allocation,
     read_config,
+    read_halt_detail,
+    read_halt_summary,
     read_signal_timestamp,
     read_state,
     sum_active_budget,
@@ -743,3 +745,137 @@ def test_compute_pnl_fields_all_null_cumulative_returns_all_none(tmp_path):
     assert fields["today_pnl"] is None
     assert fields["cumulative_pnl_7d"] is None
     assert fields["cumulative_pnl_30d"] is None
+
+
+# ── Halt status (audit-26 spec §2) ──────────────────────────────────────────
+#
+# Per ~/projects/cto/reviews/2026-04-26-audit-26-halt-status-spec.md.
+# read_halt_summary: 2-field dict for /api/v1/strategies list endpoint
+#                    (cached via _cached, part of 9-strategy fan-out).
+# read_halt_detail:  4-field dict for /api/v1/strategies/{id}/halted
+#                    (NOT cached, supports M3.b /close race-protection).
+
+
+def test_halt_summary_false_when_stop_absent(tmp_path):
+    """No STOP file → halted=False, halted_reason=None."""
+    (tmp_path / ".nodeble-wheel" / "data").mkdir(parents=True)
+    result = read_halt_summary("wheel", home=tmp_path)
+    assert result == {"halted": False, "halted_reason": None}
+
+
+def test_halt_summary_true_with_first_line_reason(tmp_path):
+    """STOP file exists with content → halted=True, halted_reason=first line."""
+    stop_dir = tmp_path / ".nodeble-wheel"
+    stop_dir.mkdir()
+    (stop_dir / "STOP").write_text("Reconcile drift detected\nUNCLASSIFIED: SPY 260430C690")
+    result = read_halt_summary("wheel", home=tmp_path)
+    assert result == {"halted": True, "halted_reason": "Reconcile drift detected"}
+
+
+def test_halt_summary_empty_file_falls_back_to_default(tmp_path):
+    """STOP file present but empty → halted=True, halted_reason=fallback string."""
+    stop_dir = tmp_path / ".nodeble-wheel"
+    stop_dir.mkdir()
+    (stop_dir / "STOP").touch()  # empty
+    result = read_halt_summary("wheel", home=tmp_path)
+    assert result["halted"] is True
+    assert result["halted_reason"] == "系统检测到异常,请联系管理员"
+
+
+def test_halt_summary_unknown_strategy_returns_safe_default(tmp_path):
+    """Unknown strategy_id → halted=False (don't surface as halted)."""
+    result = read_halt_summary("nonexistent_strategy", home=tmp_path)
+    assert result == {"halted": False, "halted_reason": None}
+
+
+def test_halt_summary_ic_uses_nodeble_no_suffix(tmp_path):
+    """IC's STOP path is ~/.nodeble/STOP (historical no-suffix). Verify mapping."""
+    ic_dir = tmp_path / ".nodeble"
+    ic_dir.mkdir()
+    (ic_dir / "STOP").write_text("IC drift")
+    result = read_halt_summary("ic", home=tmp_path)
+    assert result == {"halted": True, "halted_reason": "IC drift"}
+
+
+def test_halt_detail_false_when_stop_absent(tmp_path):
+    """No STOP file → 4-field dict all None / False."""
+    (tmp_path / ".nodeble-wheel").mkdir()
+    result = read_halt_detail("wheel", home=tmp_path)
+    assert result == {
+        "halted": False,
+        "reason": None,
+        "halted_at": None,
+        "full_content": None,
+    }
+
+
+def test_halt_detail_true_with_full_content(tmp_path):
+    """STOP file exists → halted=True, reason=first line, full_content=full body, halted_at=ISO mtime."""
+    stop_dir = tmp_path / ".nodeble-wheel"
+    stop_dir.mkdir()
+    full_body = "Reconcile drift detected\nUNCLASSIFIED: SPY 260430C690\nThree lines"
+    (stop_dir / "STOP").write_text(full_body)
+    result = read_halt_detail("wheel", home=tmp_path)
+    assert result["halted"] is True
+    assert result["reason"] == "Reconcile drift detected"
+    assert result["full_content"] == full_body
+    assert result["halted_at"] is not None  # ISO 8601 string
+    # Sanity check ISO format
+    assert "T" in result["halted_at"]
+
+
+def test_halt_detail_empty_file_falls_back(tmp_path):
+    """Empty STOP file → halted=True, reason=fallback, full_content empty string."""
+    stop_dir = tmp_path / ".nodeble-wheel"
+    stop_dir.mkdir()
+    (stop_dir / "STOP").touch()
+    result = read_halt_detail("wheel", home=tmp_path)
+    assert result["halted"] is True
+    assert result["reason"] == "系统检测到异常,请联系管理员"
+    assert result["full_content"] == ""
+
+
+def test_halt_detail_unknown_strategy_returns_safe_default(tmp_path):
+    """Unknown strategy_id → returns the same 4-field shape, all defaults."""
+    result = read_halt_detail("nonexistent_strategy", home=tmp_path)
+    assert result == {
+        "halted": False,
+        "reason": None,
+        "halted_at": None,
+        "full_content": None,
+    }
+
+
+def test_build_strategy_card_includes_halt_fields_when_halted(tmp_path):
+    """build_strategy_card injects halted + halted_reason from STOP file."""
+    wheel_dir = tmp_path / ".nodeble-wheel"
+    (wheel_dir / "data").mkdir(parents=True)
+    (wheel_dir / "config").mkdir(parents=True)
+    (wheel_dir / "data" / "state.json").write_text(json.dumps({
+        "last_scan_date": "2026-04-19",
+        "last_manage_date": "2026-04-19T14:30:00",
+        "positions": {},
+    }))
+    (wheel_dir / "config" / "strategy.yaml").write_text(yaml.safe_dump({"mode": "live"}))
+    (wheel_dir / "STOP").write_text("Manual halt by operator")
+
+    card = state_reader.build_strategy_card("wheel", home=tmp_path)
+    assert card["halted"] is True
+    assert card["halted_reason"] == "Manual halt by operator"
+
+
+def test_build_strategy_card_halted_false_default(tmp_path):
+    """build_strategy_card returns halted=False when no STOP file."""
+    wheel_dir = tmp_path / ".nodeble-wheel"
+    (wheel_dir / "data").mkdir(parents=True)
+    (wheel_dir / "config").mkdir(parents=True)
+    (wheel_dir / "data" / "state.json").write_text(json.dumps({
+        "last_scan_date": "2026-04-19",
+        "last_manage_date": "2026-04-19T14:30:00",
+        "positions": {},
+    }))
+    (wheel_dir / "config" / "strategy.yaml").write_text(yaml.safe_dump({"mode": "live"}))
+
+    card = state_reader.build_strategy_card("wheel", home=tmp_path)
+    assert card["halted"] is False
+    assert card["halted_reason"] is None
