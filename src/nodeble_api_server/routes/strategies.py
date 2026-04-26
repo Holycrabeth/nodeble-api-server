@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from nodeble_api_server.actions import run_strategy_scan
+from nodeble_api_server.actions import run_strategy_close, run_strategy_scan
 from nodeble_api_server.audit import audit_path, write_event
 from nodeble_api_server.audit_reader import read_audit_entries
 from nodeble_api_server.auth import require_bearer_token
@@ -101,6 +101,178 @@ def get_positions(strategy_id: str) -> dict:
     if state is None:
         return {"positions": []}
     return {"positions": positions_as_list(state.get("positions", []))}
+
+
+# ── M3.b close-by-id (per ARCH-18 §2 contract + M3.b spec §2) ────────────────
+
+
+def _find_position(strategy_id: str, position_id: str) -> dict | None:
+    """Look up a position by id within a strategy's state.json. Returns the
+    position dict or None. Position keys vary by module — most use a
+    string id (`SPY_iron_condor_*`, `std_*`, etc.). We look up by exact
+    match against the dict key, then fall back to scanning for a
+    position_id field within values (some modules may use list-of-dicts).
+    """
+    state = read_state(strategy_id)
+    if state is None:
+        return None
+    positions = state.get("positions", {})
+    if isinstance(positions, dict):
+        # Exact key match
+        if position_id in positions:
+            return positions[position_id]
+        # Fallback: scan values for `position_id` field
+        for v in positions.values():
+            if isinstance(v, dict) and v.get("position_id") == position_id:
+                return v
+        return None
+    if isinstance(positions, list):
+        for p in positions:
+            if isinstance(p, dict) and (
+                p.get("position_id") == position_id or p.get("id") == position_id
+            ):
+                return p
+        return None
+    return None
+
+
+@router.get("/{strategy_id}/positions/{position_id}/close-preview")
+def get_close_preview(strategy_id: str, position_id: str) -> dict:
+    """Read-only preview for M3.b CloseConfirmModal.
+
+    Per M3.b spec §2.1 — returns position info + halt status. Estimated
+    close value is null in v1 (no broker integration in api-server;
+    quotes come live during the close subprocess invocation). Frontend
+    shows position composition + 'estimated $$ not available' note;
+    customer still sees what they're closing for the safety check.
+
+    Halt status is re-verified at request time (NOT 5s cached) so the
+    Close button on a freshly-halted strategy doesn't proceed.
+    """
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+
+    pos = _find_position(strategy_id, position_id)
+    if pos is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Position not found: {position_id}",
+        )
+
+    status = pos.get("status", "unknown")
+    if str(status).startswith("closed_") or status == "closed":
+        raise HTTPException(
+            status_code=410,
+            detail=f"Position already closed (status={status})",
+        )
+
+    # Halt re-verify (NOT cached — race protection)
+    halt = read_halt_detail(strategy_id)
+
+    # Build legs array per M3.b §2.1 contract.
+    # Position schemas vary across 9 modules; do best-effort field mapping
+    # without requiring per-module shim. Frontend tolerates missing fields.
+    raw_legs = pos.get("legs", []) or []
+    legs: list[dict] = []
+    for leg in raw_legs:
+        if not isinstance(leg, dict):
+            continue
+        legs.append({
+            "identifier": leg.get("identifier") or leg.get("contract_id") or "",
+            "leg_type": "option",  # all 9 modules trade options as legs
+            "side": leg.get("side") or leg.get("action") or leg.get("direction") or "",
+            "contracts": leg.get("contracts") or leg.get("quantity") or 0,
+            "entry_price": leg.get("entry_price") or leg.get("fill_price"),
+            "current_bid": None,    # v1 — no live quote in preview
+            "current_ask": None,
+            "current_mid": None,
+            "quote_age_seconds": None,
+        })
+
+    now_iso = datetime.now(ZoneInfo("America/New_York")).isoformat()
+    return {
+        "position_id": position_id,
+        "strategy_id": strategy_id,
+        "symbol": pos.get("underlying") or pos.get("symbol") or "SPY",
+        "position_type": pos.get("type") or pos.get("strategy_type") or strategy_id,
+        "status": status,
+        "legs": legs,
+        "estimated_close_value": None,        # v1 — broker integration deferred
+        "estimated_realized_pnl": None,       # v1
+        "staleness_warning": None,
+        "any_quote_missing": True,            # v1 — no quotes fetched
+        "halted": halt["halted"],
+        "halted_reason": halt["reason"],
+        "fetched_at": now_iso,
+    }
+
+
+class CloseRequest(BaseModel):
+    """POST /strategies/{id}/positions/{pid}/close body.
+
+    `confirm_text` MUST be exactly "CLOSE" (case-sensitive) to fire a real
+    close order. This is the typed-confirmation gate — same UX pattern as
+    M3.a "LIVE SCAN" (per CEO 2026-04-22). Mismatch → 400.
+
+    `dry_run` defaults to False (real order). Caller (frontend modal) sets
+    `dry_run=True` only for testing flows — production close-button click
+    is always real. Module's own dry_run config still applies on top
+    (i.e. if module yaml has mode: dry_run, the close subprocess won't
+    place a real order even with this flag False).
+    """
+    confirm_text: str = Field(min_length=1)
+    dry_run: bool = False
+
+
+@router.post("/{strategy_id}/positions/{position_id}/close")
+def post_close(strategy_id: str, position_id: str, payload: CloseRequest) -> dict:
+    """Place a close order via subprocess to module CLI.
+
+    Body: {"confirm_text": "CLOSE", "dry_run": false}
+
+    Validation chain (per M3.b spec §2.2):
+      400 — confirm_text != "CLOSE" (case-sensitive)
+      404 — unknown strategy_id
+      409 — strategy halted (re-verified NOT cached)
+
+    Then invokes `python -m <pkg> --mode close --position-id <id>
+    [--dry-run]` as subprocess, parses ARCH-18 §2.4 JSON contract from
+    final stdout line, and returns CloseResult dict.
+
+    Synchronous (waits up to DEFAULT_CLOSE_TIMEOUT_SEC for subprocess);
+    frontend shows loading spinner during wait. Mirror M3.a sync pattern.
+    """
+    # 1. Validate confirm_text
+    if payload.confirm_text != "CLOSE":
+        raise HTTPException(
+            status_code=400,
+            detail="confirm_text must be exactly 'CLOSE' (case-sensitive)",
+        )
+
+    # 2. Validate strategy exists
+    if strategy_id not in STRATEGY_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+
+    # 3. Halt re-verify (NOT cached — race protection)
+    halt = read_halt_detail(strategy_id)
+    if halt["halted"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "strategy halted",
+                "halted_reason": halt["reason"],
+                "halted_at": halt["halted_at"],
+            },
+        )
+
+    # 4. Invoke subprocess
+    result = run_strategy_close(
+        strategy_id, position_id,
+        dry_run=payload.dry_run,
+    )
+
+    # 5. Return result as dict
+    return asdict(result)
 
 
 class ValidatePayload(BaseModel):

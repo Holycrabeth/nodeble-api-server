@@ -218,3 +218,227 @@ def _build_env() -> dict[str, str]:
     different from the shim path (config_writer.run_shim) where we need
     the api-server's own module importable in the strategy venv."""
     return dict(os.environ)
+
+
+# ── M3.b close-by-id subprocess (ARCH-18 §2 contract) ───────────────────────
+#
+# Each strategy module's CLI exposes:
+#   python -m <pkg> --mode close --position-id <id> [--dry-run]
+#
+# Per ARCH-18 §2.3 exit codes:
+#   0 — completed (all legs filled)
+#   1 — generic failure (broker / validation)
+#   2 — halted (STOP file present)
+#   3 — position not found
+#   4 — already closed
+#   5 — partial fill (state NOT marked fully closed)
+#
+# Per ARCH-18 §2.4: the FINAL line of stdout is a JSON object with 7 keys:
+#   {status, position_id, closed_at, fill_price, realized_pnl, per_leg_fills, error}
+#
+# api-server runs the subprocess, parses the final stdout line into the
+# CloseResult below, maps exit code to a task-status string, and returns
+# the lot to the frontend. M3.b CloseConfirmModal renders the result.
+
+# Close timeouts: subprocess can take 30s+ for live broker round-trips
+# (combo close + per-leg verify polling). 90s gives headroom without
+# making the customer wait forever if Tiger is stuck.
+DEFAULT_CLOSE_TIMEOUT_SEC = 90.0
+
+
+@dataclass(frozen=True)
+class CloseResult:
+    """Outcome of a single close-position invocation.
+
+    `task_status` values map ARCH-18 exit codes to UX-friendly strings:
+      - "completed"      — exit 0 (all legs filled, success)
+      - "failed"         — exit 1 (generic failure)
+      - "halted"         — exit 2 (STOP file present)
+      - "not_found"      — exit 3 (position id unknown to module)
+      - "already_closed" — exit 4 (status not in active set)
+      - "partial_fill"   — exit 5 (some legs unfilled — CRITICAL)
+      - "timeout"        — api-server SIGKILL'd subprocess past deadline
+      - "spawn_error"    — couldn't start subprocess (venv missing, etc.)
+
+    `module_payload` is the parsed final-line JSON from module stdout (per
+    ARCH-18 §2.4 contract). May be None if subprocess died before emitting
+    JSON or stdout couldn't be parsed.
+    """
+
+    task_status: str
+    exit_code: int | None
+    duration_ms: int
+    module_payload: dict | None
+    stdout_tail: str
+    stderr_tail: str
+    started_at: str
+    completed_at: str
+    error: str | None = None
+
+
+# Exit code → task_status mapping
+_CLOSE_EXIT_TO_TASK_STATUS: dict[int, str] = {
+    0: "completed",
+    1: "failed",
+    2: "halted",
+    3: "not_found",
+    4: "already_closed",
+    5: "partial_fill",
+}
+
+
+def _parse_module_close_payload(stdout: str) -> dict | None:
+    """Find the final non-empty stdout line and parse it as JSON.
+
+    Per ARCH-18 §2.4, modules emit human-readable logs to stderr or non-final
+    stdout, then a single JSON object as the final stdout line. Walks lines
+    backwards to skip trailing whitespace.
+    """
+    if not stdout:
+        return None
+    import json as _json
+
+    # Walk backwards over lines, find first non-empty
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = _json.loads(line)
+        except _json.JSONDecodeError:
+            return None  # final line wasn't JSON — module misbehaved
+        if isinstance(payload, dict):
+            return payload
+        return None
+    return None
+
+
+def run_strategy_close(
+    strategy_id: str,
+    position_id: str,
+    *,
+    dry_run: bool = False,
+    timeout_sec: float = DEFAULT_CLOSE_TIMEOUT_SEC,
+    home: Path | None = None,
+) -> CloseResult:
+    """Invoke `python -m <strategy-pkg> --mode close --position-id <id>`
+    against the strategy's own venv, parse the §2.4 JSON contract, and
+    return the outcome.
+
+    `dry_run=True` adds `--dry-run` to the CLI (safe path: simulate close,
+    no real orders). Default False — caller (route layer) is responsible
+    for confirm-text gating before invoking with dry_run=False.
+
+    Halt re-verification happens INSIDE the module CLI (per ARCH-18 §2.2
+    contract), AND the route layer re-checks STOP file before invoking
+    (race-protection — defense in depth).
+    """
+    pkg = _strategy_package(strategy_id)
+    if pkg is None:
+        return _close_spawn_error(
+            strategy_id, position_id,
+            f"unknown strategy: {strategy_id!r}",
+        )
+
+    venv = strategy_venv_python(strategy_id, home=home)
+    if venv is None or not venv.exists():
+        return _close_spawn_error(
+            strategy_id, position_id,
+            f"venv python not found: {venv}",
+        )
+
+    cmd: list[str] = [
+        str(venv), "-m", pkg,
+        "--mode", "close",
+        "--position-id", position_id,
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+
+    started = datetime.now(_SERVER_TZ)
+    started_iso = started.isoformat()
+    t0 = started.timestamp()
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            env=_build_env(),
+        )
+    except subprocess.TimeoutExpired as e:
+        duration_ms = int((datetime.now(_SERVER_TZ).timestamp() - t0) * 1000)
+        completed_iso = datetime.now(_SERVER_TZ).isoformat()
+        stdout_so_far = e.stdout or ""
+        stderr_so_far = e.stderr or ""
+        if isinstance(stdout_so_far, bytes):
+            stdout_so_far = stdout_so_far.decode("utf-8", errors="replace")
+        if isinstance(stderr_so_far, bytes):
+            stderr_so_far = stderr_so_far.decode("utf-8", errors="replace")
+        return CloseResult(
+            task_status="timeout",
+            exit_code=None,
+            duration_ms=duration_ms,
+            module_payload=_parse_module_close_payload(stdout_so_far),
+            stdout_tail=_tail(stdout_so_far),
+            stderr_tail=_tail(stderr_so_far),
+            started_at=started_iso,
+            completed_at=completed_iso,
+            error=f"close timed out after {timeout_sec}s",
+        )
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        return _close_spawn_error(
+            strategy_id, position_id,
+            f"spawn: {type(e).__name__}: {e}",
+        )
+
+    completed = datetime.now(_SERVER_TZ)
+    completed_iso = completed.isoformat()
+    duration_ms = int((completed.timestamp() - t0) * 1000)
+
+    # Drop the cache so subsequent /strategies + /positions reflect the
+    # state.json change the close just wrote.
+    clear_cache()
+
+    payload = _parse_module_close_payload(proc.stdout or "")
+    task_status = _CLOSE_EXIT_TO_TASK_STATUS.get(
+        proc.returncode,
+        "failed",  # unknown exit code → conservative "failed"
+    )
+
+    error_msg: str | None = None
+    if task_status != "completed":
+        if payload and isinstance(payload.get("error"), str):
+            error_msg = payload["error"]
+        else:
+            error_msg = f"exit code {proc.returncode}"
+
+    return CloseResult(
+        task_status=task_status,
+        exit_code=proc.returncode,
+        duration_ms=duration_ms,
+        module_payload=payload,
+        stdout_tail=_tail(proc.stdout or ""),
+        stderr_tail=_tail(proc.stderr or ""),
+        started_at=started_iso,
+        completed_at=completed_iso,
+        error=error_msg,
+    )
+
+
+def _close_spawn_error(strategy_id: str, position_id: str, detail: str) -> CloseResult:
+    """Return a CloseResult for pre-subprocess failures (unknown strategy,
+    missing venv). Mirrors _spawn_error for ScanResult."""
+    now = datetime.now(_SERVER_TZ).isoformat()
+    return CloseResult(
+        task_status="spawn_error",
+        exit_code=None,
+        duration_ms=0,
+        module_payload=None,
+        stdout_tail="",
+        stderr_tail="",
+        started_at=now,
+        completed_at=now,
+        error=detail,
+    )
