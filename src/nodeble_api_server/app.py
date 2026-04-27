@@ -106,3 +106,18 @@ app.include_router(_orchestrator.router)
 app.include_router(_system.router)
 app.include_router(_server.router)  # /api/v1/server/* — GUI v1 install wizard backend
 app.include_router(ws.router)
+
+
+# Phase A Week 2: on api-server boot, mark any in-flight installs as failed.
+# Subprocesses don't survive systemd restart, so any 'running'/'queued' state
+# is stale and would confuse SSE/status endpoints.
+@app.on_event("startup")
+def _cleanup_stale_installs() -> None:
+    from nodeble_api_server import install_state as _install_state
+    cleaned = _install_state.cleanup_stale_running()
+    if cleaned:
+        import logging
+        logging.getLogger(__name__).info(
+            "Phase A Week 2 boot cleanup: marked %d stale installs as failed: %s",
+            len(cleaned), cleaned,
+        )
