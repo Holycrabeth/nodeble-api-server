@@ -127,8 +127,28 @@ def test_strategy_versions_returns_manifest_skeleton(client):
 # ── Lifecycle: install ──────────────────────────────────────────────────────
 
 
+def _put_creds(client) -> None:
+    """Helper: store dummy Tiger creds via PUT before POST /install.
+
+    Mirrors the realistic customer flow (Step 1 PUT creds → Step 2 POST install)
+    and satisfies the reuse_tiger_creds=true gate added 2026-04-29 (UI 总监
+    Bug 1 fix: must 422 if reuse=true and no creds present).
+    """
+    r = client.put(
+        "/api/v1/server/credentials/tiger",
+        headers=_hdr(),
+        json={
+            "tiger_id": "test-tiger-id",
+            "tiger_account": "U1234567",
+            "private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
+        },
+    )
+    assert r.status_code == 200
+
+
 def test_install_returns_202_with_urls(client):
     """POST /install returns 202 + sse_url + status_url + log_url."""
+    _put_creds(client)
     r = client.post(
         "/api/v1/server/install/wheel",
         headers=_hdr(),
@@ -155,6 +175,7 @@ def test_install_404_unknown_strategy(client):
 
 def test_install_idempotent_same_install_id(client):
     """Two POSTs with same install_id return same install (no double-spawn)."""
+    _put_creds(client)
     body = {"install_id": "test-uuid-2", "config": {}}
     r1 = client.post("/api/v1/server/install/wheel", headers=_hdr(), json=body)
     assert r1.status_code == 202
@@ -168,6 +189,7 @@ def test_install_enforces_dry_run_mode_server_side(client):
     """Even if frontend POSTs config={mode: live}, backend must override to dry_run.
     Per Phase 4.1 contract §1.2 + UI 总监 Gap 2 fix.
     """
+    _put_creds(client)
     r = client.post(
         "/api/v1/server/install/wheel",
         headers=_hdr(),
@@ -180,6 +202,62 @@ def test_install_enforces_dry_run_mode_server_side(client):
     state = server_mod._INSTALL_STATE["test-mode-enforce"]
     enforced = state["config_with_mode_dry_run_enforced"]
     assert enforced["mode"] == "dry_run", "backend MUST override mode to dry_run"
+
+
+def test_install_422_when_reuse_creds_true_but_creds_missing(client):
+    """UI 总监 Bug 1 fix (2026-04-29 audit): reuse_tiger_creds=true + creds NOT
+    on disk MUST return 422 fail-fast — NOT 202 with subprocess that will fail
+    30s later at "Resolving Tiger credentials" step. Saves user 30s of bad UX.
+
+    Spec amendment to freeze line 144 (was: "422: Tiger creds missing AND
+    reuse_tiger_creds: false" — also covers reuse_tiger_creds: true + creds
+    not on disk).
+    """
+    # Note: NO _put_creds(client) call — creds intentionally absent
+    r = client.post(
+        "/api/v1/server/install/wheel",
+        headers=_hdr(),
+        json={
+            "install_id": "test-bug1-422",
+            "config": {"budget": 30000},
+            "reuse_tiger_creds": True,
+        },
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert "tiger" in body["detail"].lower() or "creds" in body["detail"].lower(), (
+        f"422 detail should mention Tiger creds; got: {body['detail']}"
+    )
+    # Verify NO install state was created — gate must fire before install_state.create()
+    assert "test-bug1-422" not in server_mod._INSTALL_STATE
+
+
+def test_install_202_when_reuse_creds_true_and_creds_present(client):
+    """Bug 1 control: reuse_tiger_creds=true with creds PUT first → 202 (normal flow)."""
+    _put_creds(client)
+    r = client.post(
+        "/api/v1/server/install/wheel",
+        headers=_hdr(),
+        json={
+            "install_id": "test-bug1-control",
+            "config": {"budget": 30000},
+            "reuse_tiger_creds": True,
+        },
+    )
+    assert r.status_code == 202
+
+
+def test_install_default_reuse_creds_is_true_so_gate_applies(client):
+    """Bug 1 default behavior: omitting reuse_tiger_creds defaults to True per
+    InstallRequest schema, so gate must apply same as explicit true.
+    """
+    # NO creds PUT — should still 422 even though reuse_tiger_creds is omitted
+    r = client.post(
+        "/api/v1/server/install/wheel",
+        headers=_hdr(),
+        json={"install_id": "test-bug1-default", "config": {}},
+    )
+    assert r.status_code == 422
 
 
 # ── Lifecycle: validate ─────────────────────────────────────────────────────
@@ -313,6 +391,7 @@ def test_install_status_404_unknown(client):
 
 def test_install_status_returns_state_after_install(client):
     """POST /install then GET /status — should see the state."""
+    _put_creds(client)
     client.post(
         "/api/v1/server/install/wheel",
         headers=_hdr(),
@@ -334,6 +413,7 @@ def test_install_log_404_unknown(client):
 
 
 def test_install_log_returns_text_plain(client):
+    _put_creds(client)
     client.post(
         "/api/v1/server/install/wheel",
         headers=_hdr(),
@@ -348,6 +428,7 @@ def test_install_log_returns_text_plain(client):
 
 def test_install_stream_returns_sse_content_type(client):
     """SSE endpoint sets text/event-stream + emits valid event format."""
+    _put_creds(client)
     client.post(
         "/api/v1/server/install/wheel",
         headers=_hdr(),

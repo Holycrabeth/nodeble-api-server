@@ -119,8 +119,28 @@ def post_install(strategy: str, payload: InstallRequest) -> dict:
 
     Per contract §1.2: enforce mode=dry_run server-side regardless of payload
     (UI 总监 Gap 2 fix). Idempotent: same install_id returns existing.
+
+    Pre-spawn validation per UI 总监 Bug 1 audit (2026-04-29):
+      reuse_tiger_creds=true + Tiger creds NOT on disk → 422 fail-fast
+      (was: 202 + subprocess fail at "Resolving Tiger credentials" 30s later =
+      bad UX). Spec amendment to freeze line 144.
     """
     _validate_strategy(strategy)
+
+    # Bug 1 gate: reuse_tiger_creds=true requires creds already on disk.
+    # If reuse=false, creds must come in payload.config — that schema check
+    # is Week 2 install_runner concern, not this route stub.
+    if payload.reuse_tiger_creds:
+        creds = tiger_creds.summary()
+        if not creds.get("exists"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Tiger credentials not found on server. "
+                    "Either PUT /api/v1/server/credentials/tiger first, "
+                    "or set reuse_tiger_creds=false and include creds in config payload."
+                ),
+            )
 
     # CRITICAL — enforce dry_run default per UI 总监 Gap 2 catch
     # Real impl Week 3: subprocess writes to strategy.yaml before invoking deploy.sh
