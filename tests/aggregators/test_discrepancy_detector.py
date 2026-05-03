@@ -1,4 +1,4 @@
-"""Discrepancy detector tests — Phase 2.1+ (C2 money shot, 4/29-class catch).
+"""Discrepancy detector tests — Phase 2.1+2.2+2.3 (C2 money shot).
 
 Covers `detect_telegram_close_mismatch` (Phase 2.1):
 - Positive: 4/29 case (Telegram "Closed 2", ledger 0) → 1 high-severity discrepancy
@@ -10,12 +10,24 @@ Covers `detect_stale_state` (Phase 2.2):
 - Negative: fresh state mtime → no discrepancy
 - Negative: market closed → no flag even if stale
 
+Covers `detect_missing_cron_run` (Phase 2.3):
+- Positive: scheduled fire + 5min grace passed, no log entry → high
+- Negative: not yet due (now < expected + grace) → no flag
+- Negative: fire happened within grace → no flag
+- Negative: weekend → no flag (cron not expected)
+
+Covers `detect_ledger_state_mismatch` (Phase 2.3):
+- Positive: state count != ledger count → high
+- Negative: counts match → no flag
+
 Spec ref: cto/reviews/2026-05-02-dashboard-daily-ops-card-design.md §C2
-Plan ref: plans/2026-05-02-dashboard-daily-ops-card-plan.md Phase 2.1+2.2
+Plan ref: plans/2026-05-02-dashboard-daily-ops-card-plan.md Phase 2.1+2.2+2.3
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from nodeble_api_server.aggregators.discrepancy_detector import (
+    detect_ledger_state_mismatch,
+    detect_missing_cron_run,
     detect_stale_state,
     detect_telegram_close_mismatch,
 )
@@ -136,5 +148,131 @@ def test_stale_state_when_market_closed_no_discrepancy():
 
     discrepancies = detect_stale_state(
         bot_id="wheel", state_mtime=stale, now=now, market_open=False
+    )
+    assert discrepancies == []
+
+
+# ---------- Phase 2.3: detect_missing_cron_run ----------
+
+
+# Mon 2026-05-04: pick a weekday to anchor the schedule tests.
+_SCHEDULE = {
+    "signal": time(9, 35),
+    "manage": time(9, 43),
+    "scan": time(10, 15),
+}
+
+
+def test_missing_cron_signal_after_grace_flags_high():
+    """Signal expected at 9:35 ET, now is 9:50 ET, no fire → high-severity flag."""
+    # 2026-05-04 13:50 UTC = 09:50 ET Monday (15min after signal expected)
+    now = datetime(2026, 5, 4, 13, 50, tzinfo=timezone.utc)
+    cron_log_fires: list[str] = []  # nothing fired today
+
+    discrepancies = detect_missing_cron_run(
+        bot_id="wheel",
+        cron_schedule_et=_SCHEDULE,
+        cron_log_fires=cron_log_fires,
+        now=now,
+    )
+    # All 3 (signal, manage — both grace-expired; scan still in future) — only signal+manage
+    flagged = [d["type"] for d in discrepancies]
+    assert all(t == "missing_cron_run" for t in flagged)
+    details = " ".join(d["detail"] for d in discrepancies)
+    assert "signal" in details
+    assert "manage" in details
+    # scan not yet due (10:15 + 5min = 10:20, now is 9:50)
+    assert "scan" not in details
+    assert all(d["severity"] == "high" for d in discrepancies)
+    assert all(d["bot_id"] == "wheel" for d in discrepancies)
+
+
+def test_missing_cron_not_yet_due_no_flag():
+    """Now is 9:30 ET, signal not expected until 9:35 → no flag (not due yet)."""
+    # 2026-05-04 13:30 UTC = 09:30 ET Monday
+    now = datetime(2026, 5, 4, 13, 30, tzinfo=timezone.utc)
+    cron_log_fires: list[str] = []
+
+    discrepancies = detect_missing_cron_run(
+        bot_id="wheel",
+        cron_schedule_et=_SCHEDULE,
+        cron_log_fires=cron_log_fires,
+        now=now,
+    )
+    assert discrepancies == []  # everything still future
+
+
+def test_missing_cron_fire_within_grace_no_flag():
+    """Manage scheduled 9:43 ET, fired at 9:46 ET (within 5min grace) → no flag."""
+    # 2026-05-04 14:00 UTC = 10:00 ET Monday (well past all schedules)
+    now = datetime(2026, 5, 4, 14, 0, tzinfo=timezone.utc)
+    cron_log_fires = [
+        "2026-05-04T13:36:00+00:00",  # signal at 09:36 ET (1min late, in grace)
+        "2026-05-04T13:46:00+00:00",  # manage at 09:46 ET (3min late, in grace)
+        # scan at 10:15 ET still future at 10:00 ET — no flag
+    ]
+    # only check signal+manage subset (not scan since it's still future)
+    schedule = {"signal": time(9, 35), "manage": time(9, 43)}
+    discrepancies = detect_missing_cron_run(
+        bot_id="wheel",
+        cron_schedule_et=schedule,
+        cron_log_fires=cron_log_fires,
+        now=now,
+    )
+    assert discrepancies == []
+
+
+def test_missing_cron_on_weekend_no_flag():
+    """Saturday → cron not expected, no flag even with empty fire log."""
+    # 2026-05-02 14:00 UTC Saturday
+    now = datetime(2026, 5, 2, 14, 0, tzinfo=timezone.utc)
+    discrepancies = detect_missing_cron_run(
+        bot_id="wheel",
+        cron_schedule_et=_SCHEDULE,
+        cron_log_fires=[],
+        now=now,
+    )
+    assert discrepancies == []
+
+
+# ---------- Phase 2.3: detect_ledger_state_mismatch ----------
+
+
+def test_ledger_state_mismatch_flags_high():
+    """state.json shows 5 closed but ledger has 3 close entries → high-severity."""
+    discrepancies = detect_ledger_state_mismatch(
+        bot_id="wheel",
+        state_close_count=5,
+        ledger_close_count=3,
+        session_start="2026-05-04T13:30:00+00:00",
+    )
+    assert len(discrepancies) == 1
+    d = discrepancies[0]
+    assert d["type"] == "ledger_state_mismatch"
+    assert d["severity"] == "high"
+    assert d["bot_id"] == "wheel"
+    assert "state.json" in d["detail"]
+    assert "5" in d["detail"]
+    assert "3" in d["detail"]
+
+
+def test_ledger_state_mismatch_matching_no_flag():
+    """state.json matches ledger close count → silent."""
+    discrepancies = detect_ledger_state_mismatch(
+        bot_id="wheel",
+        state_close_count=3,
+        ledger_close_count=3,
+        session_start="2026-05-04T13:30:00+00:00",
+    )
+    assert discrepancies == []
+
+
+def test_ledger_state_mismatch_both_zero_no_flag():
+    """Both 0 (no closes today) → silent — common pre-market case."""
+    discrepancies = detect_ledger_state_mismatch(
+        bot_id="ic",
+        state_close_count=0,
+        ledger_close_count=0,
+        session_start="2026-05-04T13:30:00+00:00",
     )
     assert discrepancies == []
