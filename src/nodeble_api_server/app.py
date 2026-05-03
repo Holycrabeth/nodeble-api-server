@@ -99,12 +99,14 @@ from nodeble_api_server.routes import market as _market  # noqa: E402
 from nodeble_api_server.routes import orchestrator as _orchestrator  # noqa: E402
 from nodeble_api_server.routes import system as _system  # noqa: E402
 from nodeble_api_server.routes import server as _server  # noqa: E402
+from nodeble_api_server.routes import daily_summary as _daily_summary  # noqa: E402
 
 app.include_router(_strategies.router)
 app.include_router(_market.router)
 app.include_router(_orchestrator.router)
 app.include_router(_system.router)
 app.include_router(_server.router)  # /api/v1/server/* — GUI v1 install wizard backend
+app.include_router(_daily_summary.router)  # /api/v1/server/daily-summary — Dashboard "今日运营"
 app.include_router(ws.router)
 
 
