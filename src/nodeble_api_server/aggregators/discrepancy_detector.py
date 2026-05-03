@@ -13,8 +13,15 @@ Spec ref: cto/reviews/2026-05-02-dashboard-daily-ops-card-design.md §C2
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, TypedDict
+
+# >2h with no state-file write while market is open is the signal that
+# cron has silently died (typical fire cadence is every ~5 min). Set
+# generously enough that benign skips (e.g. one missed manage cron) don't
+# noise the dashboard, but tight enough that a half-day silent failure
+# can't go unnoticed.
+STALE_STATE_THRESHOLD = timedelta(hours=2)
 
 
 class Discrepancy(TypedDict):
@@ -98,6 +105,52 @@ def detect_telegram_close_mismatch(
                 ),
                 "severity": "high",
                 "detected_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+    return []
+
+
+def detect_stale_state(
+    bot_id: str,
+    state_mtime: str,
+    now: datetime,
+    market_open: bool,
+) -> list[Discrepancy]:
+    """Flag if state.json hasn't been updated in >2h during a live session.
+
+    During market hours each module's cron (signal / scan / manage) writes
+    state every ~5 minutes. If state mtime is > STALE_STATE_THRESHOLD old
+    while market_open=True, cron is silently failing — flag med-severity.
+
+    When market_open=False (pre-market, after-close, weekend) cron isn't
+    expected to fire, so stale state is benign — skip detection entirely.
+
+    Args:
+        bot_id: One of "ic" / "wheel" / "pmcc" / "directionalspread".
+        state_mtime: ISO 8601 string of the state.json file mtime
+                (caller does the os.stat → datetime conversion).
+        now: Current time, timezone-aware UTC.
+        market_open: From `compute_session(now).market_open` — caller
+                already computed the session window so we don't redo it.
+
+    Returns:
+        Empty list if market closed OR state is fresh.
+        Single med-severity discrepancy on stale + market open.
+    """
+    if not market_open:
+        return []
+    mtime = datetime.fromisoformat(state_mtime)
+    if now - mtime > STALE_STATE_THRESHOLD:
+        return [
+            {
+                "bot_id": bot_id,
+                "type": "stale_state_during_session",
+                "detail": (
+                    f"{bot_id} state.json last updated {mtime.isoformat()}, "
+                    f">2h during active market session — cron may have failed silently"
+                ),
+                "severity": "med",
+                "detected_at": now.isoformat(),
             }
         ]
     return []
