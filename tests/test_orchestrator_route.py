@@ -485,3 +485,126 @@ def test_installed_strategies_get_requires_auth(client_with_fake_home):
     client, _ = client_with_fake_home
     r = client.get("/api/v1/orchestrator/installed-strategies")
     assert r.status_code == 401
+
+
+# ── Polish round (CTO 5/4 verdict + 协作总监 5/4 dispatch) ──────────────────
+
+
+def test_allocate_post_clears_cache_returns_fresh_not_stale(
+    client_with_fake_home, monkeypatch,
+):
+    """P2 cache-staleness fix (CTO 5/4 verdict file
+    cto/reviews/2026-05-04-orch-phase-oa-post-verify.md).
+
+    Without state_reader.clear_cache() between subprocess success and
+    read_allocation(), the response would return the pre-write cached
+    version (5s TTL) — frontend Step 4 audit reproduced the stale
+    generated_at bug.
+
+    This test: seed allocation.json with old generated_at + populate
+    cache, then have subprocess "update" the file with new
+    generated_at, then verify POST response carries the NEW
+    generated_at (not the cached old one).
+    """
+    client, tmp_path = client_with_fake_home
+    alloc_path = tmp_path / ".nodeble-orchestrator" / "data" / "allocation.json"
+    alloc_path.parent.mkdir(parents=True, exist_ok=True)
+
+    old = {"regime": "Neutral", "generated_at": "2026-05-04T09:58:02-04:00", "stale_marker": True}
+    alloc_path.write_text(json.dumps(old))
+
+    # Prime the cache with the OLD value.
+    state_reader.clear_cache()
+    cached = state_reader.read_allocation()
+    assert cached["generated_at"] == "2026-05-04T09:58:02-04:00"
+
+    # Now subprocess "writes" a NEW allocation.json (later timestamp).
+    new = {"regime": "Bullish", "generated_at": "2026-05-04T10:15:00-04:00", "stale_marker": False}
+
+    def fake_run(args, **kw):
+        alloc_path.write_text(json.dumps(new))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orch_route.subprocess, "run", fake_run)
+
+    r = client.post(
+        "/api/v1/orchestrator/allocate", headers=_hdr(),
+        json={"respect_overrides": False, "force_nlv_refresh": False, "force": True},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # The response must reflect the FRESH file content (cache cleared),
+    # not the cached OLD content.
+    assert body["generated_at"] == "2026-05-04T10:15:00-04:00", (
+        f"stale cache leaked into response: got {body['generated_at']}"
+    )
+    assert body["regime"] == "Bullish"
+    assert body["stale_marker"] is False
+
+    # Subsequent GET /allocation also sees fresh (cache stays cleared).
+    r2 = client.get("/api/v1/orchestrator/allocation", headers=_hdr())
+    assert r2.json()["generated_at"] == "2026-05-04T10:15:00-04:00"
+
+
+def test_overrides_put_no_envelope_rejected_422(client_with_fake_home):
+    """extra='forbid' lesson #52: missing top-level `overrides:` envelope
+    must 422, not silently no-op. Frontend audit 5/4 lost time chasing
+    a phantom backend bug because PUT silently accepted curl shape
+    `{ic: {...}}` with extra='ignore' default."""
+    client, _ = client_with_fake_home
+    r = client.put(
+        "/api/v1/orchestrator/overrides", headers=_hdr(),
+        json={"ic": {"fixed_cap_usd": 100, "locked": False}},  # no "overrides:" envelope
+    )
+    assert r.status_code == 422
+
+
+def test_overrides_put_extra_field_rejected_422(client_with_fake_home):
+    """extra='forbid' on OverridesIn — typo'd top-level fields surface as 422."""
+    client, _ = client_with_fake_home
+    r = client.put(
+        "/api/v1/orchestrator/overrides", headers=_hdr(),
+        json={
+            "overrides": {"ic": {"fixed_cap_usd": 100, "locked": True}},
+            "typo_field": "value",
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_overrides_put_extra_per_strategy_field_rejected_422(client_with_fake_home):
+    """extra='forbid' on OverrideCap — typo inside a strategy entry surfaces as 422."""
+    client, _ = client_with_fake_home
+    r = client.put(
+        "/api/v1/orchestrator/overrides", headers=_hdr(),
+        json={"overrides": {"ic": {
+            "fixed_cap_usd": 100,
+            "locked": True,
+            "lockd": True,  # typo of `locked`
+        }}},
+    )
+    assert r.status_code == 422
+
+
+def test_allocate_post_extra_field_rejected_422(client_with_fake_home):
+    """extra='forbid' on AllocateIn — typo'd flag (e.g. force_relfresh) must 422."""
+    client, _ = client_with_fake_home
+    r = client.post(
+        "/api/v1/orchestrator/allocate", headers=_hdr(),
+        json={"respect_overrides": True, "junk": 1},
+    )
+    assert r.status_code == 422
+
+
+def test_overrides_get_still_200_regression(client_with_fake_home):
+    """Regression check: extra='forbid' is on input models only; GET /overrides
+    response shape unchanged."""
+    client, tmp_path = client_with_fake_home
+    p = tmp_path / ".nodeble-orchestrator" / "config" / "overrides.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(yaml.safe_dump({
+        "overrides": {"ic": {"fixed_cap_usd": 50000, "locked": True}},
+    }))
+    r = client.get("/api/v1/orchestrator/overrides", headers=_hdr())
+    assert r.status_code == 200
+    assert r.json()["overrides"]["ic"]["fixed_cap_usd"] == 50000

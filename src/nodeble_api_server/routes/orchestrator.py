@@ -39,8 +39,9 @@ from typing import Any
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from nodeble_api_server import state_reader
 from nodeble_api_server.auth import require_bearer_token
 from nodeble_api_server.state_reader import read_allocation, STRATEGY_REGISTRY
 
@@ -97,7 +98,13 @@ class OverrideCap(BaseModel):
 
     Validation error for step uses literal ``cap_step_violation`` token
     so frontend can grep — 协作总监 5/4 PUT contract.
+
+    ``extra='forbid'`` (lesson #52 from frontend audit 5/4) — silently
+    accepting unknown fields turned the missing-envelope curl into a
+    "PUT 200 no-op" trap. Strict rejection surfaces shape bugs at 422.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     fixed_cap_usd: int = Field(..., ge=0)
     locked: bool
@@ -116,13 +123,25 @@ class OverridesIn(BaseModel):
     PUT body shape mirrors ``overrides.yaml`` top-level structure so the
     file-on-disk and the wire are isomorphic. Strategies omitted from
     ``overrides`` are **cleared** (allocator falls back to computed cap).
+
+    ``extra='forbid'`` rejects bodies missing the ``overrides:`` envelope
+    (e.g. the curl ``{ic: {...}}`` shape that frontend audit 5/4
+    misdiagnosed as a backend bug — lesson #52).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     overrides: dict[str, OverrideCap] = Field(default_factory=dict)
 
 
 class AllocateIn(BaseModel):
-    """POST /allocate body."""
+    """POST /allocate body.
+
+    ``extra='forbid'`` — typo'd flags should 422, not silently no-op
+    (lesson #52 from frontend audit 5/4).
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     respect_overrides: bool = False
     force_nlv_refresh: bool = False
@@ -413,6 +432,17 @@ def post_allocate(payload: AllocateIn) -> dict:
         )
 
     # Subprocess wrote allocation.json + lock. Read fresh to return.
+    #
+    # P2 cache-staleness fix (CTO 5/4 verdict file
+    # cto/reviews/2026-05-04-orch-phase-oa-post-verify.md, frontend
+    # Step 4 audit reproduce): state_reader has a 5s TTL cache used by
+    # GET /allocation. Without explicit invalidation, this read after
+    # subprocess write would return the pre-write cached value — POST
+    # /allocate would respond with the stale allocation, and any
+    # immediate GET /allocation would also be stale until TTL expires.
+    # Clear the cache so both this response AND subsequent GETs see the
+    # fresh file.
+    state_reader.clear_cache()
     fresh = read_allocation()
     if fresh is None:
         # Subprocess reported success but file isn't there — file race or bug.
