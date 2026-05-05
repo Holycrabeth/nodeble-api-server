@@ -1,20 +1,19 @@
-"""Tests for install_runner — Phase A Week 3 DRAFT.
+"""Tests for install_runner.py (Phase A Week 3 — 5/5 contract).
 
-Parser tests are pure unit (no I/O). Subprocess tests use a tiny bash
-script that emits STEP/STATUS lines + sleep, validating that
-run_install correctly:
-  - parses STEP / STATUS ok / STATUS fail
-  - emits 'log' events for bare lines + stderr
-  - emits 'complete' on subprocess exit
-  - times out and SIGTERMs on budget excess
-  - handles non-zero exit code with no STATUS: fail
+Two layers:
+
+- Pure parser tests (`_parse_line`) — fast, no subprocess.
+- Integration tests (`run_install`) — real subprocess via tiny `bash -c`
+  scripts that emit the 5/5 STEP/STATUS/RESULT contract on stdout. This
+  exercises the full pipeline (subprocess spawn, line drain, state
+  persistence, terminal handling) without needing a real deploy.sh on
+  disk — Wheel/IC/PMCC/DS deploy.sh ships are blocked on Phase C+D and
+  not needed for parser-side acceptance.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-import stat
 from pathlib import Path
 
 import pytest
@@ -22,238 +21,323 @@ import pytest
 from nodeble_api_server import install_runner, install_state
 
 
-# ── Parser unit tests (pure, no I/O) ────────────────────────────────────────
+# ── _parse_line: 5/5 contract shapes ────────────────────────────────────────
 
 
-def test_parse_step_line():
-    p = install_runner._parse_line("STEP: Cloning nodeble-wheel\n")
+def test_parse_step_start():
+    p = install_runner._parse_line("STEP: clone-repo")
     assert p.event_type == "step"
-    assert p.payload == {"step": "Cloning nodeble-wheel", "status": "in_progress"}
+    assert p.payload == {"step": "clone-repo", "status": "in_progress"}
     assert p.is_terminal is False
 
 
-def test_parse_status_ok_no_message():
-    p = install_runner._parse_line("STATUS: ok\n")
+def test_parse_step_success_with_check_glyph():
+    p = install_runner._parse_line("STEP: clone-repo ✓")
     assert p.event_type == "step"
-    assert p.payload == {"status": "ok"}
-    assert "message" not in p.payload
+    assert p.payload == {"step": "clone-repo", "status": "ok"}
 
 
-def test_parse_status_ok_with_message():
-    p = install_runner._parse_line("STATUS: ok venv created\n")
-    assert p.event_type == "step"
-    assert p.payload == {"status": "ok", "message": "venv created"}
-
-
-def test_parse_status_fail_is_terminal():
-    p = install_runner._parse_line("STATUS: fail pip install failed: SSL cert error\n")
+def test_parse_step_failure_with_summary():
+    p = install_runner._parse_line("STEP: clone-repo ✗ git clone failed")
     assert p.event_type == "step"
     assert p.payload["status"] == "failed"
-    assert "SSL cert error" in p.payload["error"]
+    assert p.payload["error"] == "git clone failed"
+    assert p.payload["step"] == "clone-repo"
+
+
+def test_parse_step_failure_no_summary_substitutes_default():
+    p = install_runner._parse_line("STEP: clone-repo ✗")
+    assert p.event_type == "step"
+    assert p.payload["status"] == "failed"
+    assert p.payload["error"] == "step failed (no summary)"
+
+
+def test_parse_status_success_terminal():
+    p = install_runner._parse_line("STATUS: success")
+    assert p.event_type == "status"
+    assert p.payload == {"status": "success"}
     assert p.is_terminal is True
 
 
-def test_parse_bare_line_is_log_info():
-    p = install_runner._parse_line("Cloning into 'nodeble-wheel'...\n")
+def test_parse_status_already_installed_terminal():
+    p = install_runner._parse_line("STATUS: already_installed")
+    assert p.event_type == "status"
+    assert p.payload == {"status": "already_installed"}
+    assert p.is_terminal is True
+
+
+def test_parse_status_failure_terminal_carries_reason():
+    p = install_runner._parse_line("STATUS: failure: clone_failed")
+    assert p.event_type == "status"
+    assert p.payload == {"status": "failed", "error": "clone_failed"}
+    assert p.is_terminal is True
+
+
+def test_parse_result_metadata():
+    p = install_runner._parse_line("RESULT_VERSION: 0.7.2")
+    assert p.event_type == "result"
+    assert p.payload == {"key": "VERSION", "value": "0.7.2"}
+
+
+def test_parse_result_iso_timestamp_value():
+    p = install_runner._parse_line("RESULT_INSTALLED_AT: 2026-05-05T13:30:00Z")
+    assert p.event_type == "result"
+    assert p.payload == {"key": "INSTALLED_AT", "value": "2026-05-05T13:30:00Z"}
+
+
+def test_parse_bare_stdout_line_is_log_info():
+    p = install_runner._parse_line("downloading deps...", is_stderr=False)
     assert p.event_type == "log"
-    assert p.payload == {"level": "info", "message": "Cloning into 'nodeble-wheel'..."}
+    assert p.payload == {"level": "info", "message": "downloading deps..."}
 
 
-def test_parse_stderr_line_is_log_warn():
-    p = install_runner._parse_line("warning: deprecated\n", is_stderr=True)
+def test_parse_bare_stderr_line_is_log_warn():
+    p = install_runner._parse_line("warning: 1 deprecation", is_stderr=True)
     assert p.event_type == "log"
-    assert p.payload["level"] == "warn"
+    assert p.payload == {"level": "warn", "message": "warning: 1 deprecation"}
 
 
-def test_parse_long_line_does_not_crash():
-    """200+ char STATUS line — parser must not crash even if deploy.sh
-    forgot to truncate (Wheel dev Q4 contract says 200-char cap, but
-    we should be defensive)."""
-    long_msg = "X" * 500
-    p = install_runner._parse_line(f"STATUS: fail {long_msg}\n")
-    assert p.event_type == "step"
-    assert p.payload["status"] == "failed"
-    assert long_msg in p.payload["error"]
+def test_parse_status_precedence_over_step_prefix_collision():
+    """Defensive: 'STATUS: success' must not be mistaken for a STEP line."""
+    p = install_runner._parse_line("STATUS: success")
+    assert p.event_type == "status"
+    assert p.event_type != "step"
 
 
-def test_parse_whitespace_tolerant():
-    p = install_runner._parse_line("STEP:    Setting up venv   \n")
-    assert p.payload["step"] == "Setting up venv"
+def test_parse_handles_trailing_whitespace_and_crlf():
+    p = install_runner._parse_line("STATUS: success \r\n")
+    assert p.event_type == "status"
+    assert p.payload["status"] == "success"
 
 
-def test_parse_empty_line_is_empty_log():
-    p = install_runner._parse_line("\n")
-    assert p.event_type == "log"
-    assert p.payload["message"] == ""
-
-
-def test_parse_step_without_colon_is_log():
-    """`STEP foo` (no colon) is NOT a step — it's a log line."""
-    p = install_runner._parse_line("STEP foo\n")
+def test_parse_unknown_status_falls_through_to_log():
+    """STATUS: foo (not success/already_installed/failure:) → log line."""
+    p = install_runner._parse_line("STATUS: pending")
     assert p.event_type == "log"
 
 
-# ── Subprocess integration tests (mock bash script) ─────────────────────────
+# ── run_install: integration via fake bash scripts ──────────────────────────
 
 
 @pytest.fixture
-def mock_deploy_script(tmp_path: Path):
-    """A bash script that emits STEP/STATUS lines for testing run_install."""
-    def _build(content: str) -> Path:
-        path = tmp_path / "mock_deploy.sh"
-        path.write_text(content)
-        path.chmod(path.stat().st_mode | stat.S_IXUSR)
-        return path
-    return _build
-
-
-def test_run_install_happy_path(tmp_path, mock_deploy_script):
-    """Deploy script emits 2 steps, exits 0. Expect: 2 step events (in_prog+ok
-    each) + 1 complete event with status=success."""
-    script = mock_deploy_script(
-        "#!/bin/bash\n"
-        "echo 'STEP: Validating config'\n"
-        "echo 'STATUS: ok'\n"
-        "echo 'STEP: Cloning repo'\n"
-        "echo 'Cloning into ...'\n"
-        "echo 'STATUS: ok'\n"
-    )
-
+def fake_install(tmp_path: Path):
+    """Create an install_state entry for tests + return install_id + tmp home."""
+    install_id = "test-install-1"
     install_state.create(
-        install_id="t1", strategy="wheel", config={}, home=tmp_path,
+        install_id=install_id,
+        strategy="wheel",
+        config={"capital_usd": 50000},
+        home=tmp_path,
+    )
+    return install_id, tmp_path
+
+
+def _bash_cmd(*lines: str) -> list[str]:
+    """Build a tiny bash -c that emits the given lines on stdout, then exits."""
+    body = "\n".join(f"echo '{line}'" for line in lines)
+    return ["bash", "-c", body]
+
+
+def test_run_install_happy_path_success(fake_install):
+    install_id, home = fake_install
+    cmd = _bash_cmd(
+        "STEP: clone-repo",
+        "STEP: clone-repo ✓",
+        "STEP: venv-create",
+        "STEP: venv-create ✓",
+        "RESULT_VERSION: 0.7.2",
+        "RESULT_SERVICE_NAME: nodeble-wheel-bot.service",
+        "STATUS: success",
     )
 
-    async def go():
-        return await install_runner.run_install(
-            install_id="t1",
-            cmd=["bash", str(script)],
-            home=tmp_path,
-        )
+    result = asyncio.run(install_runner.run_install(
+        install_id=install_id, cmd=cmd, home=home,
+    ))
 
-    result = asyncio.run(go())
     assert result["status"] == "success"
-    assert result["duration_ms"] >= 0
+    assert result["result_metadata"] == {
+        "VERSION": "0.7.2",
+        "SERVICE_NAME": "nodeble-wheel-bot.service",
+    }
 
-    events = list(install_state.replay_events("t1", home=tmp_path))
-    step_events = [e for e in events if e["event"] == "step"]
-    log_events = [e for e in events if e["event"] == "log"]
-    complete_events = [e for e in events if e["event"] == "complete"]
-    assert len(step_events) == 4  # 2 steps × (start + ok)
-    assert len(log_events) == 1   # "Cloning into ..."
-    assert len(complete_events) == 1
-    assert complete_events[0]["data"]["status"] == "success"
+    # State.json reflects success
+    state = install_state.read(install_id, home=home)
+    assert state["status"] == "success"
+    assert state["completed_at"] is not None
+    assert state["error"] is None
+    assert state["result_metadata"] == {
+        "VERSION": "0.7.2",
+        "SERVICE_NAME": "nodeble-wheel-bot.service",
+    }
 
 
-def test_run_install_status_fail_triggers_failed_complete(tmp_path, mock_deploy_script):
-    """STATUS: fail → emits failed step + complete(failed)."""
-    script = mock_deploy_script(
-        "#!/bin/bash\n"
-        "echo 'STEP: Setting up venv'\n"
-        "echo 'STATUS: fail pip install failed'\n"
-        "exit 1\n"
+def test_run_install_already_installed_terminal(fake_install):
+    install_id, home = fake_install
+    cmd = _bash_cmd("STATUS: already_installed")
+
+    result = asyncio.run(install_runner.run_install(
+        install_id=install_id, cmd=cmd, home=home,
+    ))
+
+    assert result["status"] == "already_installed"
+    state = install_state.read(install_id, home=home)
+    assert state["status"] == "already_installed"
+
+
+def test_run_install_failure_with_reason(fake_install):
+    install_id, home = fake_install
+    cmd = _bash_cmd(
+        "STEP: clone-repo",
+        "STEP: clone-repo ✗ permission denied",
+        "STATUS: failure: clone_failed",
     )
 
-    install_state.create(install_id="t2", strategy="wheel", config={}, home=tmp_path)
+    result = asyncio.run(install_runner.run_install(
+        install_id=install_id, cmd=cmd, home=home,
+    ))
 
-    async def go():
-        return await install_runner.run_install(
-            install_id="t2",
-            cmd=["bash", str(script)],
-            home=tmp_path,
-        )
-
-    result = asyncio.run(go())
     assert result["status"] == "failed"
-    assert "pip install failed" in result["error"]
-
-    state = install_state.read("t2", home=tmp_path)
+    assert "clone_failed" in result["error"]
+    state = install_state.read(install_id, home=home)
     assert state["status"] == "failed"
-    assert "pip install failed" in state["error"]
 
 
-def test_run_install_nonzero_exit_no_status_fail(tmp_path, mock_deploy_script):
-    """Subprocess exits non-zero without STATUS: fail → synthetic failed complete."""
-    script = mock_deploy_script(
-        "#!/bin/bash\n"
-        "echo 'STEP: Doing thing'\n"
-        "exit 42\n"  # crash without STATUS: fail
-    )
+def test_run_install_subprocess_exit_zero_no_status_treated_failed(fake_install):
+    """Contract violation: deploy.sh exits 0 without STATUS terminal → failed."""
+    install_id, home = fake_install
+    cmd = ["bash", "-c", "echo 'some progress'; exit 0"]
 
-    install_state.create(install_id="t3", strategy="wheel", config={}, home=tmp_path)
+    result = asyncio.run(install_runner.run_install(
+        install_id=install_id, cmd=cmd, home=home,
+    ))
 
-    async def go():
-        return await install_runner.run_install(
-            install_id="t3",
-            cmd=["bash", str(script)],
-            home=tmp_path,
-        )
-
-    result = asyncio.run(go())
     assert result["status"] == "failed"
-    assert "42" in result["error"]
+    assert "STATUS terminal" in result["error"]
 
 
-def test_run_install_budget_timeout(tmp_path, mock_deploy_script):
-    """Subprocess sleeps past budget → SIGTERM + complete(failed) with budget error."""
-    script = mock_deploy_script(
-        "#!/bin/bash\n"
-        "echo 'STEP: Long task'\n"
-        "sleep 30\n"
-    )
+def test_run_install_subprocess_exits_nonzero_with_no_status(fake_install):
+    install_id, home = fake_install
+    cmd = ["bash", "-c", "echo 'oops'; exit 7"]
 
-    install_state.create(install_id="t4", strategy="wheel", config={}, home=tmp_path)
+    result = asyncio.run(install_runner.run_install(
+        install_id=install_id, cmd=cmd, home=home,
+    ))
 
-    async def go():
-        return await install_runner.run_install(
-            install_id="t4",
-            cmd=["bash", str(script)],
-            total_budget_ms=200,  # 0.2s budget — script sleeps 30s
-            home=tmp_path,
-        )
-
-    result = asyncio.run(go())
     assert result["status"] == "failed"
-    assert "budget" in result["error"].lower()
-    assert result["duration_ms"] < 10_000  # well under the 30s sleep
+    assert "exited with code 7" in result["error"]
 
 
-def test_run_install_state_progresses_to_running_then_terminal(tmp_path, mock_deploy_script):
-    """Verify state.json reflects each lifecycle stage."""
-    script = mock_deploy_script(
-        "#!/bin/bash\n"
-        "echo 'STEP: A'\n"
-        "echo 'STATUS: ok'\n"
+def test_run_install_emits_complete_event_to_jsonl(fake_install):
+    install_id, home = fake_install
+    cmd = _bash_cmd("STATUS: success")
+    asyncio.run(install_runner.run_install(install_id=install_id, cmd=cmd, home=home))
+
+    events = list(install_state.replay_events(install_id, home=home))
+    # Last event should be the 'complete' terminal
+    assert events[-1]["event"] == "complete"
+    assert events[-1]["data"]["status"] == "success"
+
+
+def test_run_install_steps_completed_recorded(fake_install):
+    install_id, home = fake_install
+    cmd = _bash_cmd(
+        "STEP: clone-repo",
+        "STEP: clone-repo ✓",
+        "STEP: venv-create",
+        "STEP: venv-create ✓",
+        "STATUS: success",
     )
+    asyncio.run(install_runner.run_install(install_id=install_id, cmd=cmd, home=home))
 
-    install_state.create(install_id="t5", strategy="wheel", config={}, home=tmp_path)
-    pre_state = install_state.read("t5", home=tmp_path)
-    assert pre_state["status"] == "queued"
-
-    async def go():
-        await install_runner.run_install(
-            install_id="t5", cmd=["bash", str(script)], home=tmp_path,
-        )
-
-    asyncio.run(go())
-
-    final_state = install_state.read("t5", home=tmp_path)
-    assert final_state["status"] == "success"
-    assert final_state["completed_at"] is not None
-    assert len(final_state["steps_completed"]) == 1
-    assert final_state["steps_completed"][0]["step"] == "A"
+    state = install_state.read(install_id, home=home)
+    completed = state["steps_completed"]
+    assert len(completed) == 2
+    assert completed[0]["step"] == "clone-repo"
+    assert completed[0]["status"] == "ok"
+    assert completed[1]["step"] == "venv-create"
 
 
-def test_build_deploy_cmd_format(tmp_path):
-    """Smoke test for the cmd builder helper."""
-    cfg_path = tmp_path / "cfg.json"
+def test_run_install_failed_step_recorded_in_steps_completed(fake_install):
+    install_id, home = fake_install
+    cmd = _bash_cmd(
+        "STEP: clone-repo",
+        "STEP: clone-repo ✗ network",
+        "STATUS: failure: clone_failed",
+    )
+    asyncio.run(install_runner.run_install(install_id=install_id, cmd=cmd, home=home))
+
+    state = install_state.read(install_id, home=home)
+    completed = state["steps_completed"]
+    assert len(completed) == 1
+    assert completed[0]["step"] == "clone-repo"
+    assert completed[0]["status"] == "failed"
+    assert completed[0]["error"] == "network"
+
+
+def test_run_install_log_lines_appended_to_log_tail(fake_install):
+    install_id, home = fake_install
+    cmd = _bash_cmd(
+        "downloading 12345 bytes",
+        "STATUS: success",
+    )
+    asyncio.run(install_runner.run_install(install_id=install_id, cmd=cmd, home=home))
+
+    state = install_state.read(install_id, home=home)
+    log_messages = [e["message"] for e in state["log_tail"]]
+    assert "downloading 12345 bytes" in log_messages
+
+
+def test_run_install_subprocess_failed_to_start(fake_install):
+    """Bash binary missing or path invalid → graceful failed event."""
+    install_id, home = fake_install
+    cmd = ["/nonexistent/bin/totally-not-a-thing"]
+
+    result = asyncio.run(install_runner.run_install(
+        install_id=install_id, cmd=cmd, home=home,
+    ))
+
+    assert result["status"] == "failed"
+    assert "subprocess failed to start" in result["error"]
+    state = install_state.read(install_id, home=home)
+    assert state["status"] == "failed"
+
+
+def test_run_install_total_budget_timeout_sigterm(fake_install):
+    """Budget < script duration → SIGTERM + failed."""
+    install_id, home = fake_install
+    cmd = ["bash", "-c", "sleep 10"]
+
+    result = asyncio.run(install_runner.run_install(
+        install_id=install_id, cmd=cmd, home=home,
+        total_budget_ms=200,
+    ))
+
+    assert result["status"] == "failed"
+    assert "exceeded budget" in result["error"]
+
+
+# ── build_deploy_cmd ────────────────────────────────────────────────────────
+
+
+def test_build_deploy_cmd_basic(tmp_path: Path):
+    cfg = tmp_path / "wheel-config.json"
+    cfg.write_text("{}")
     deploy_root = tmp_path / "nodeble-wheel"
     cmd = install_runner.build_deploy_cmd(
-        strategy="wheel",
-        config_json_path=cfg_path,
-        deploy_root=deploy_root,
+        strategy="wheel", config_json_path=cfg, deploy_root=deploy_root,
     )
     assert cmd[0] == "bash"
     assert cmd[1] == str(deploy_root / "deploy" / "deploy.sh")
     assert "--non-interactive" in cmd
     assert "--config" in cmd
-    assert str(cfg_path) in cmd
+    assert str(cfg) in cmd
+
+
+def test_build_deploy_cmd_with_extra_args(tmp_path: Path):
+    cfg = tmp_path / "config.json"
+    deploy_root = tmp_path / "nodeble"
+    cmd = install_runner.build_deploy_cmd(
+        strategy="ic", config_json_path=cfg, deploy_root=deploy_root,
+        extra_args=["--skip-telegram"],
+    )
+    assert cmd[-1] == "--skip-telegram"
