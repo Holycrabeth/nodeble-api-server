@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from nodeble_api_server.auth import require_bearer_token
 from nodeble_api_server.state_reader import STRATEGY_REGISTRY
 from nodeble_api_server import (
+    crontab_ops,
     install_runner,
     install_state,
     logs as logs_module,
@@ -66,9 +67,14 @@ _TIGER_CREDS_STUB: dict[str, Any] = {"exists": False, "account": None, "stored_a
 # pins each task until its done-callback removes it.
 _RUNNING_INSTALL_TASKS: set[asyncio.Task] = set()
 
-# Hardcoded api-server systemd --user unit name. Override via env var if
-# the deploy uses a different unit name; verify on first SaaS deploy.
-_API_SERVER_SYSTEMD_UNIT = "api-server.service"
+# A11 fix (CTO ticket 2026-05-05): unit name was `api-server.service` but
+# Tower verify-from-source confirms real systemd --user unit is named
+# `nodeble-api-server.service`. The typo silently returned `lines: []` from
+# /logs/api-server because journalctl was queried for a non-existent unit.
+# Single source of truth: crontab_ops.DEFAULT_API_SERVER_UNIT — both
+# /logs/api-server (journalctl) and lifecycle endpoints (process binding
+# check) use the same constant.
+_API_SERVER_SYSTEMD_UNIT = "nodeble-api-server.service"
 
 
 def _utc_iso() -> str:
@@ -284,15 +290,50 @@ def post_install_validate(strategy: str, payload: ValidateRequest) -> dict:
 
 @router.post("/uninstall/{strategy}")
 def post_uninstall(strategy: str) -> dict:
-    """Remove install (stub: returns ok). Real impl Week 2 stops bot
-    service, removes cron, archives state. 409 if open positions.
+    """Remove strategy's cron lines (Path C Item 4 — Phase A follow-up).
+
+    Crontab editing goes through ``crontab_ops.uninstall_strategy_cron``
+    which enforces the L1 §7.11 #8 4-constraint contract (process binding
+    check, path+module scope, pre-edit backup, post-edit verification).
+
+    On constraint failure → 422 with diagnostic. Other failures → 500.
+
+    Note: this endpoint currently handles **cron removal only**. Stopping
+    the systemd --user bot service + archiving state.json + open-position
+    409 gating remain in their Week 1 stubs (deferred to a separate
+    follow-up PR — frontend currently only uses pause/resume; hard
+    uninstall waits on the wider lifecycle UX from 前端总监).
     """
     _validate_strategy(strategy)
-    # Stub: real impl checks state.json for open positions, returns 409 if any
+    # install_id encodes the action moment; reuses the install_state pattern
+    # for pre-edit backup naming.
+    install_id = f"uninstall-{strategy}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    result = crontab_ops.uninstall_strategy_cron(strategy, install_id)
+    if not result["ok"]:
+        if result.get("error") == "process_binding_check_failed":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": result["error"],
+                    "diagnostic": result.get("diagnostic"),
+                },
+            )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": result.get("error"),
+                "backup_path": result.get("backup_path"),
+                "restored_from_backup": result.get("restored_from_backup"),
+            },
+        )
     return {
         "status": "uninstalled",
         "uninstalled_at": _utc_iso(),
-        "state_archive_path": f"~/.nodeble-pnl/data/state_archive/{strategy}/{datetime.now().strftime('%Y-%m-%d')}.json",
+        "lines_changed": result["lines_changed"],
+        "backup_path": result["backup_path"],
+        # state_archive_path remains a TODO until state-archiving wiring lands;
+        # frontend should not depend on this field yet.
+        "state_archive_path": None,
     }
 
 
@@ -342,24 +383,78 @@ async def post_update(strategy: str, payload: UpdateRequest) -> dict:
 
 @router.post("/pause/{strategy}")
 def post_pause(strategy: str) -> dict:
-    """Disable scanner cron. Stub returns paused. Real impl Week 2
-    edits crontab.
+    """Comment-out strategy's cron lines (Path C Item 4 — Phase A follow-up).
+
+    Adds ``# PAUSED-by-api: `` prefix to every in-scope line so cron
+    treats them as comments. ``resume`` strips the prefix.
+
+    Crontab editing goes through ``crontab_ops.pause_strategy`` which
+    enforces the L1 §7.11 #8 4-constraint contract (process binding
+    check, path+module scope, pre-edit backup, post-edit verification).
     """
     _validate_strategy(strategy)
+    install_id = f"pause-{strategy}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    result = crontab_ops.pause_strategy(strategy, install_id)
+    if not result["ok"]:
+        if result.get("error") == "process_binding_check_failed":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": result["error"],
+                    "diagnostic": result.get("diagnostic"),
+                },
+            )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": result.get("error"),
+                "backup_path": result.get("backup_path"),
+                "restored_from_backup": result.get("restored_from_backup"),
+            },
+        )
     return {
         "status": "paused",
         "paused_at": _utc_iso(),
+        "lines_changed": result["lines_changed"],
+        "backup_path": result["backup_path"],
+        # cron_disabled list preserved for backward-compat with frontend that
+        # may show "Signal/Scan disabled" badges — populated heuristically
+        # since real-time cron-line introspection is not implemented yet.
         "cron_disabled": ["signal", "scan"],
     }
 
 
 @router.post("/resume/{strategy}")
 def post_resume(strategy: str) -> dict:
-    """Re-enable scanner cron. Stub returns running."""
+    """Strip ``# PAUSED-by-api: `` prefix from strategy's cron lines.
+
+    See ``post_pause`` for details. Same 4-constraint contract enforcement.
+    """
     _validate_strategy(strategy)
+    install_id = f"resume-{strategy}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    result = crontab_ops.resume_strategy(strategy, install_id)
+    if not result["ok"]:
+        if result.get("error") == "process_binding_check_failed":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": result["error"],
+                    "diagnostic": result.get("diagnostic"),
+                },
+            )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": result.get("error"),
+                "backup_path": result.get("backup_path"),
+                "restored_from_backup": result.get("restored_from_backup"),
+            },
+        )
     return {
         "status": "running",
         "resumed_at": _utc_iso(),
+        "lines_changed": result["lines_changed"],
+        "backup_path": result["backup_path"],
     }
 
 

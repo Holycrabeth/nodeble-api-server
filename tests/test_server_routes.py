@@ -101,6 +101,19 @@ def client(tmp_path: Path, monkeypatch):
     # under tmp_path/projects/* — empty).
     monkeypatch.setattr(server_mod.install_runner, "run_install", _noop_run_install)
 
+    # Path C Item 4 follow-up: monkeypatch crontab_ops.pause/resume/uninstall
+    # to return success without touching the real crontab/systemctl. Tests
+    # that need to exercise the real wiring + error paths override per-test.
+    def _ok_crontab(strategy, install_id, **kw):
+        return {
+            "ok": True, "action": "test", "lines_changed": 1,
+            "backup_path": "/tmp/test-backup.bak",
+        }
+
+    monkeypatch.setattr(server_mod.crontab_ops, "pause_strategy", _ok_crontab)
+    monkeypatch.setattr(server_mod.crontab_ops, "resume_strategy", _ok_crontab)
+    monkeypatch.setattr(server_mod.crontab_ops, "uninstall_strategy_cron", _ok_crontab)
+
     return TestClient(app)
 
 
@@ -754,3 +767,137 @@ def test_logs_api_server_non_json_line_falls_back_to_logs_parser(client, monkeyp
     # logs.parse_log_line returns None for unparseable; fallback uses raw text
     assert len(body["lines"]) == 1
     assert "not json" in body["lines"][0]["message"]
+
+
+def test_logs_api_server_invokes_correct_unit_name(client, monkeypatch):
+    """A11 regression test (CTO ticket 2026-05-05): the systemd --user unit
+    is `nodeble-api-server.service`, NOT `api-server.service`. The earlier
+    typo silently returned `lines: []` because journalctl was queried for a
+    non-existent unit. Lock the EXACT arg here so any future renaming/typo
+    fails this test immediately."""
+    captured = []
+
+    def fake_run(args, **kw):
+        captured.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(server_mod.shutil, "which", lambda _: "/usr/bin/journalctl")
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    client.get("/api/v1/server/logs/api-server", headers=_hdr())
+    assert len(captured) == 1
+    args = captured[0]
+    # Must include `-u nodeble-api-server.service` exactly
+    assert "-u" in args
+    u_idx = args.index("-u")
+    assert args[u_idx + 1] == "nodeble-api-server.service", (
+        f"A11 regression: journalctl invoked with wrong unit name "
+        f"{args[u_idx + 1]!r} (expected 'nodeble-api-server.service')"
+    )
+
+
+# ── Path C Item 4 lifecycle endpoint wiring ─────────────────────────────────
+
+
+def test_pause_invokes_crontab_ops_pause_strategy(client, monkeypatch):
+    """POST /pause/{strategy} delegates to crontab_ops.pause_strategy with
+    the same strategy + a generated install_id."""
+    captured = []
+
+    def fake_pause(strategy, install_id, **kw):
+        captured.append({"strategy": strategy, "install_id": install_id})
+        return {
+            "ok": True, "action": "pause", "lines_changed": 3,
+            "backup_path": "/tmp/test-pause.bak",
+        }
+
+    monkeypatch.setattr(server_mod.crontab_ops, "pause_strategy", fake_pause)
+    r = client.post("/api/v1/server/pause/wheel", headers=_hdr())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "paused"
+    assert body["lines_changed"] == 3
+    assert body["backup_path"] == "/tmp/test-pause.bak"
+    assert len(captured) == 1
+    assert captured[0]["strategy"] == "wheel"
+    assert captured[0]["install_id"].startswith("pause-wheel-")
+
+
+def test_resume_invokes_crontab_ops_resume_strategy(client, monkeypatch):
+    captured = []
+
+    def fake_resume(strategy, install_id, **kw):
+        captured.append({"strategy": strategy, "install_id": install_id})
+        return {
+            "ok": True, "action": "resume", "lines_changed": 2,
+            "backup_path": "/tmp/test-resume.bak",
+        }
+
+    monkeypatch.setattr(server_mod.crontab_ops, "resume_strategy", fake_resume)
+    r = client.post("/api/v1/server/resume/wheel", headers=_hdr())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "running"
+    assert body["lines_changed"] == 2
+    assert captured[0]["install_id"].startswith("resume-wheel-")
+
+
+def test_uninstall_invokes_crontab_ops_uninstall_cron(client, monkeypatch):
+    captured = []
+
+    def fake_uninstall(strategy, install_id, **kw):
+        captured.append({"strategy": strategy, "install_id": install_id})
+        return {
+            "ok": True, "action": "uninstall", "lines_changed": 4,
+            "backup_path": "/tmp/test-uninstall.bak",
+        }
+
+    monkeypatch.setattr(server_mod.crontab_ops, "uninstall_strategy_cron", fake_uninstall)
+    r = client.post("/api/v1/server/uninstall/wheel", headers=_hdr())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "uninstalled"
+    assert body["lines_changed"] == 4
+    assert body["backup_path"] == "/tmp/test-uninstall.bak"
+    assert captured[0]["install_id"].startswith("uninstall-wheel-")
+
+
+def test_pause_returns_422_on_process_binding_failure(client, monkeypatch):
+    """Constraint (i) failure surfaces as 422 per L1 §7.11 #8 carve-out."""
+    def fail_bind(strategy, install_id, **kw):
+        return {
+            "ok": False,
+            "error": "process_binding_check_failed",
+            "diagnostic": "process not bound to nodeble-api-server.service",
+        }
+
+    monkeypatch.setattr(server_mod.crontab_ops, "pause_strategy", fail_bind)
+    r = client.post("/api/v1/server/pause/wheel", headers=_hdr())
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "process_binding_check_failed"
+    assert "diagnostic" in detail
+
+
+def test_uninstall_returns_500_on_post_write_mismatch(client, monkeypatch):
+    """Constraint (iv) post-write verification failure → 500 with diagnostic."""
+    def fail_verify(strategy, install_id, **kw):
+        return {
+            "ok": False,
+            "error": "post_write_verification_mismatch",
+            "backup_path": "/tmp/test.bak",
+            "restored_from_backup": True,
+        }
+
+    monkeypatch.setattr(server_mod.crontab_ops, "uninstall_strategy_cron", fail_verify)
+    r = client.post("/api/v1/server/uninstall/wheel", headers=_hdr())
+    assert r.status_code == 500
+    detail = r.json()["detail"]
+    assert detail["error"] == "post_write_verification_mismatch"
+    assert detail["restored_from_backup"] is True
+
+
+def test_resume_unknown_strategy_404(client):
+    """Strategy validation precedes crontab_ops call — should 404 not 422."""
+    r = client.post("/api/v1/server/resume/nonexistent", headers=_hdr())
+    assert r.status_code == 404
