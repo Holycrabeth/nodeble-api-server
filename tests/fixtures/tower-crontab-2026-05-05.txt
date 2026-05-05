@@ -1,0 +1,105 @@
+# === NODEBLE Orchestrator (13:25-13:33 ET) ===
+# === Signal (13:35-13:39 ET) ===
+# === Manage (13:43-13:47 ET) ===
+# === Scan (13:51-13:55 ET) ===
+# === PnL (14:05 ET) ===
+# === Force Manage (14:30 ET) ===
+0 16 * * 1-5 /home/mayongtao/scripts/backup-to-nas.sh # NAS backup after trading day
+00 10 * * 1-5 cd /home/mayongtao/projects/nodeble-data-collector && /home/mayongtao/projects/nodeble-data-collector/.venv/bin/python -m nodeble_data_collector collect >> /home/mayongtao/.nodeble-data-collector/logs/cron.log 2>&1 # nodeble-data-collector
+30 11 * * 1-5 cd /home/mayongtao/projects/nodeble-data-collector && /home/mayongtao/projects/nodeble-data-collector/.venv/bin/python -m nodeble_data_collector collect >> /home/mayongtao/.nodeble-data-collector/logs/cron.log 2>&1 # nodeble-data-collector
+45 16 * * 1-5 cd /home/mayongtao/projects/nodeble-data-collector && /home/mayongtao/projects/nodeble-data-collector/.venv/bin/python -m nodeble_data_collector collect >> /home/mayongtao/.nodeble-data-collector/logs/cron.log 2>&1 # nodeble-data-collector
+45 17 * * 1-5 rsync -az /home/mayongtao/.nodeble-data-collector/data/chains/ mingsliving@192.168.1.2:/volume1/MYTHOME/backups/tower/chain-data/ >> /home/mayongtao/.nodeble-data-collector/logs/cron.log 2>&1 # nodeble-data-collector
+# Network watchdog — every 2 minutes
+*/2 * * * * /home/mayongtao/scripts/network-watchdog.sh
+37 13 * * 1-5 cd /home/mayongtao/projects/nodeble-pmcc && /home/mayongtao/projects/nodeble-pmcc/.venv/bin/python -m nodeble_pmcc --mode signal >> /home/mayongtao/.nodeble-pmcc/logs/cron.log 2>&1 # nodeble-pmcc
+45 13 * * 1-5 cd /home/mayongtao/projects/nodeble-pmcc && /home/mayongtao/projects/nodeble-pmcc/.venv/bin/python -m nodeble_pmcc --mode manage >> /home/mayongtao/.nodeble-pmcc/logs/cron.log 2>&1 # nodeble-pmcc
+53 13 * * 1-5 cd /home/mayongtao/projects/nodeble-pmcc && /home/mayongtao/projects/nodeble-pmcc/.venv/bin/python -m nodeble_pmcc --mode scan >> /home/mayongtao/.nodeble-pmcc/logs/cron.log 2>&1 # nodeble-pmcc
+30 14 * * 1-5 cd /home/mayongtao/projects/nodeble-pmcc && /home/mayongtao/projects/nodeble-pmcc/.venv/bin/python -m nodeble_pmcc --mode manage --force >> /home/mayongtao/.nodeble-pmcc/logs/cron.log 2>&1 # nodeble-pmcc
+38 13 * * 1-5 cd /home/mayongtao/projects/nodeble-directionalspread && /home/mayongtao/projects/nodeble-directionalspread/.venv/bin/python -m nodeble_directionalspread --mode signal >> /home/mayongtao/.nodeble-directionalspread/logs/cron.log 2>&1 # nodeble-cs
+46 13 * * 1-5 cd /home/mayongtao/projects/nodeble-directionalspread && /home/mayongtao/projects/nodeble-directionalspread/.venv/bin/python -m nodeble_directionalspread --mode manage >> /home/mayongtao/.nodeble-directionalspread/logs/cron.log 2>&1 # nodeble-cs
+54 13 * * 1-5 cd /home/mayongtao/projects/nodeble-directionalspread && /home/mayongtao/projects/nodeble-directionalspread/.venv/bin/python -m nodeble_directionalspread --mode scan >> /home/mayongtao/.nodeble-directionalspread/logs/cron.log 2>&1 # nodeble-cs
+05 14 * * 1-5 cd /home/mayongtao/projects/nodeble-pnl && /home/mayongtao/projects/nodeble-pnl/.venv/bin/python -m nodeble_pnl --collect >> /home/mayongtao/.nodeble-pnl/logs/pnl.log 2>&1 # nodeble-pnl
+# L2 Account Reconciler (CROSS-3 — post-2026-04-15 incident)
+30 9 * * 1-5 cd /home/mayongtao/projects/nodeble-pnl && /home/mayongtao/projects/nodeble-pnl/.venv/bin/python -m nodeble_pnl --account-reconcile >> /home/mayongtao/.nodeble-pnl/logs/pnl.log 2>&1 # nodeble-pnl L2
+15 16 * * 1-5 cd /home/mayongtao/projects/nodeble-pnl && /home/mayongtao/projects/nodeble-pnl/.venv/bin/python -m nodeble_pnl --account-reconcile >> /home/mayongtao/.nodeble-pnl/logs/pnl.log 2>&1 # nodeble-pnl L2
+35 13 * * 1-5 cd /home/mayongtao/projects/nodeble && /home/mayongtao/projects/nodeble/.venv/bin/python -m nodeble --mode signal >> /home/mayongtao/.nodeble/logs/cron.log 2>&1 # nodeble-ic
+43 13 * * 1-5 cd /home/mayongtao/projects/nodeble && /home/mayongtao/projects/nodeble/.venv/bin/python -m nodeble --mode manage >> /home/mayongtao/.nodeble/logs/cron.log 2>&1 # nodeble-ic
+51 13 * * 1-5 cd /home/mayongtao/projects/nodeble && /home/mayongtao/projects/nodeble/.venv/bin/python -m nodeble --mode scan >> /home/mayongtao/.nodeble/logs/cron.log 2>&1 # nodeble-ic
+30 14 * * 1-5 cd /home/mayongtao/projects/nodeble && /home/mayongtao/projects/nodeble/.venv/bin/python -m nodeble --mode manage --force >> /home/mayongtao/.nodeble/logs/cron.log 2>&1 # nodeble-ic
+# §18(A) amendment 2026-04-13: CEO-approved early manage for ATM-body gap protection
+45 9 * * 1-5 cd /home/mayongtao/projects/nodeble-ironbutterfly && /home/mayongtao/projects/nodeble-ironbutterfly/.venv/bin/python -m nodeble_ironbutterfly --mode manage >> /home/mayongtao/.nodeble-ironbutterfly/logs/cron.log 2>&1
+# cron.conf — nodeble-ironbutterfly slots FROZEN per CLAUDE.md §18(A)
+# Deploy script substitutes /home/mayongtao/projects/nodeble-ironbutterfly, /home/mayongtao/projects/nodeble-ironbutterfly/.venv, /home/mayongtao/.nodeble-ironbutterfly/logs placeholders.
+
+# cron.conf — nodeble-ironbutterfly slots FROZEN per CLAUDE.md §18(A)
+# Deploy script substitutes /home/mayongtao/projects/nodeble-ironbutterfly, /home/mayongtao/projects/nodeble-ironbutterfly/.venv, /home/mayongtao/.nodeble-ironbutterfly/logs placeholders.
+
+39 13 * * 1-5 cd /home/mayongtao/projects/nodeble-ironbutterfly && /home/mayongtao/projects/nodeble-ironbutterfly/.venv/bin/python -m nodeble_ironbutterfly --mode signal >> /home/mayongtao/.nodeble-ironbutterfly/logs/cron.log 2>&1
+49 13 * * 1-5 cd /home/mayongtao/projects/nodeble-ironbutterfly && /home/mayongtao/projects/nodeble-ironbutterfly/.venv/bin/python -m nodeble_ironbutterfly --mode manage >> /home/mayongtao/.nodeble-ironbutterfly/logs/cron.log 2>&1
+59 13 * * 1-5 cd /home/mayongtao/projects/nodeble-ironbutterfly && /home/mayongtao/projects/nodeble-ironbutterfly/.venv/bin/python -m nodeble_ironbutterfly --mode scan >> /home/mayongtao/.nodeble-ironbutterfly/logs/cron.log 2>&1
+32 14 * * 1-5 cd /home/mayongtao/projects/nodeble-ironbutterfly && /home/mayongtao/projects/nodeble-ironbutterfly/.venv/bin/python -m nodeble_ironbutterfly --mode manage --force >> /home/mayongtao/.nodeble-ironbutterfly/logs/cron.log 2>&1
+# === nodeble-calendar (13:40, 13:50, 14:01, 14:33 ET) ===
+40 13 * * 1-5 cd /home/mayongtao/projects/nodeble-calendar && /home/mayongtao/projects/nodeble-calendar/.venv/bin/python -m nodeble_calendar --mode signal >> /home/mayongtao/.nodeble-calendar/logs/cron.log 2>&1 # nodeble-calendar
+50 13 * * 1-5 cd /home/mayongtao/projects/nodeble-calendar && /home/mayongtao/projects/nodeble-calendar/.venv/bin/python -m nodeble_calendar --mode manage >> /home/mayongtao/.nodeble-calendar/logs/cron.log 2>&1 # nodeble-calendar
+01 14 * * 1-5 cd /home/mayongtao/projects/nodeble-calendar && /home/mayongtao/projects/nodeble-calendar/.venv/bin/python -m nodeble_calendar --mode scan >> /home/mayongtao/.nodeble-calendar/logs/cron.log 2>&1 # nodeble-calendar
+33 14 * * 1-5 cd /home/mayongtao/projects/nodeble-calendar && /home/mayongtao/projects/nodeble-calendar/.venv/bin/python -m nodeble_calendar --mode manage --force >> /home/mayongtao/.nodeble-calendar/logs/cron.log 2>&1 # nodeble-calendar
+# §18(A) amendment 2026-04-13: CEO-approved early manage for unlimited-risk
+46 9 * * 1-5 cd /home/mayongtao/projects/nodeble-strangle && NODEBLE_STRANGLE_HOME=/home/mayongtao/.nodeble-strangle /home/mayongtao/projects/nodeble-strangle/.venv/bin/python -m nodeble_strangle --mode manage >> /home/mayongtao/.nodeble-strangle/logs/cron.log 2>&1
+# nodeble-strangle cron schedule — FROZEN per SPEC §5 / CLAUDE.md §18(A).
+#
+# Placeholders substituted at install time by deploy/deploy.sh:
+#   /home/mayongtao/projects/nodeble-strangle            repo root, e.g. /home/mayongtao/projects/nodeble-strangle
+#   /home/mayongtao/projects/nodeble-strangle/.venv                   virtualenv root, e.g. /home/mayongtao/projects/nodeble-strangle/.venv
+#   /home/mayongtao/.nodeble-strangle/logs                log dir, typically $NODEBLE_STRANGLE_HOME/logs
+#   /home/mayongtao/.nodeble-strangle  state/config dir, typically $HOME/.nodeble-strangle
+#
+# Cron slots (ET, Mon-Fri):
+#   13:41 — signal
+#   13:51 — manage
+#   14:01 — scan
+#   14:34 — manage --force
+#
+# Do NOT edit slots; the orchestrator and sibling modules coordinate on
+# these exact minutes. Any change requires CEO approval (CLAUDE.md §18(A)).
+
+41 13 * * 1-5 cd /home/mayongtao/projects/nodeble-strangle && NODEBLE_STRANGLE_HOME=/home/mayongtao/.nodeble-strangle /home/mayongtao/projects/nodeble-strangle/.venv/bin/python -m nodeble_strangle --mode signal >> /home/mayongtao/.nodeble-strangle/logs/cron.log 2>&1
+51 13 * * 1-5 cd /home/mayongtao/projects/nodeble-strangle && NODEBLE_STRANGLE_HOME=/home/mayongtao/.nodeble-strangle /home/mayongtao/projects/nodeble-strangle/.venv/bin/python -m nodeble_strangle --mode manage >> /home/mayongtao/.nodeble-strangle/logs/cron.log 2>&1
+01 14 * * 1-5 cd /home/mayongtao/projects/nodeble-strangle && NODEBLE_STRANGLE_HOME=/home/mayongtao/.nodeble-strangle /home/mayongtao/projects/nodeble-strangle/.venv/bin/python -m nodeble_strangle --mode scan >> /home/mayongtao/.nodeble-strangle/logs/cron.log 2>&1
+34 14 * * 1-5 cd /home/mayongtao/projects/nodeble-strangle && NODEBLE_STRANGLE_HOME=/home/mayongtao/.nodeble-strangle /home/mayongtao/projects/nodeble-strangle/.venv/bin/python -m nodeble_strangle --mode manage --force >> /home/mayongtao/.nodeble-strangle/logs/cron.log 2>&1
+# nodeble-straddle BEGIN
+# nodeble-straddle cron template — deploy.sh / update.sh substitutes placeholders.
+# §18(A) amendment 2026-04-13: CEO-approved early manage for ATM-body — catch overnight gap-gamma before 4+ hours of exposure.
+47 9 * * 1-5 cd /home/mayongtao/projects/nodeble-straddle && /home/mayongtao/projects/nodeble-straddle/.venv/bin/python -m nodeble_straddle --mode manage >> /home/mayongtao/.nodeble-straddle/logs/cron.log 2>&1
+42 13 * * 1-5 cd /home/mayongtao/projects/nodeble-straddle && /home/mayongtao/projects/nodeble-straddle/.venv/bin/python -m nodeble_straddle --mode signal >> /home/mayongtao/.nodeble-straddle/logs/cron.log 2>&1
+52 13 * * 1-5 cd /home/mayongtao/projects/nodeble-straddle && /home/mayongtao/projects/nodeble-straddle/.venv/bin/python -m nodeble_straddle --mode manage >> /home/mayongtao/.nodeble-straddle/logs/cron.log 2>&1
+02 14 * * 1-5 cd /home/mayongtao/projects/nodeble-straddle && /home/mayongtao/projects/nodeble-straddle/.venv/bin/python -m nodeble_straddle --mode scan >> /home/mayongtao/.nodeble-straddle/logs/cron.log 2>&1
+35 14 * * 1-5 cd /home/mayongtao/projects/nodeble-straddle && /home/mayongtao/projects/nodeble-straddle/.venv/bin/python -m nodeble_straddle --mode manage --force >> /home/mayongtao/.nodeble-straddle/logs/cron.log 2>&1
+# nodeble-straddle END
+
+
+# nodeble-orchestrator BEGIN
+# NODEBLE-ORCHESTRATOR-MANAGED
+# === NODEBLE Orchestrator (Phases 1-5) ===
+CRON_TZ=America/New_York
+50 9 * * 1-5 cd /home/mayongtao/projects/nodeble-orchestrator && /home/mayongtao/projects/nodeble-orchestrator/.venv/bin/python -m nodeble_orchestrator macro >> /home/mayongtao/.nodeble-orchestrator/logs/macro.log 2>&1 # NODEBLE-ORCHESTRATOR-MANAGED
+52 9 * * 1-5 cd /home/mayongtao/projects/nodeble-orchestrator && /home/mayongtao/projects/nodeble-orchestrator/.venv/bin/python -m nodeble_orchestrator vol >> /home/mayongtao/.nodeble-orchestrator/logs/vol.log 2>&1 # NODEBLE-ORCHESTRATOR-MANAGED
+54 9 * * 1-5 cd /home/mayongtao/projects/nodeble-orchestrator && /home/mayongtao/projects/nodeble-orchestrator/.venv/bin/python -m nodeble_orchestrator structure >> /home/mayongtao/.nodeble-orchestrator/logs/structure.log 2>&1 # NODEBLE-ORCHESTRATOR-MANAGED
+56 9 * * 1-5 cd /home/mayongtao/projects/nodeble-orchestrator && /home/mayongtao/projects/nodeble-orchestrator/.venv/bin/python -m nodeble_orchestrator regime >> /home/mayongtao/.nodeble-orchestrator/logs/regime.log 2>&1 # NODEBLE-ORCHESTRATOR-MANAGED
+57 9 * * 1-5 cd /home/mayongtao/projects/nodeble-orchestrator && /home/mayongtao/projects/nodeble-orchestrator/.venv/bin/python -m nodeble_orchestrator scores >> /home/mayongtao/.nodeble-orchestrator/logs/scores.log 2>&1 # NODEBLE-ORCHESTRATOR-MANAGED
+58 9 * * 1-5 cd /home/mayongtao/projects/nodeble-orchestrator && /home/mayongtao/projects/nodeble-orchestrator/.venv/bin/python -m nodeble_orchestrator allocate >> /home/mayongtao/.nodeble-orchestrator/logs/allocate.log 2>&1 # NODEBLE-ORCHESTRATOR-MANAGED
+CRON_TZ=America/New_York
+# nodeble-orchestrator END
+36 13 * * 1-5 cd /home/mayongtao/projects/nodeble-wheel && /home/mayongtao/projects/nodeble-wheel/.venv/bin/python -m nodeble_wheel --mode signal >> /home/mayongtao/.nodeble-wheel/logs/cron.log 2>&1 # nodeble-wheel
+44 13 * * 1-5 cd /home/mayongtao/projects/nodeble-wheel && /home/mayongtao/projects/nodeble-wheel/.venv/bin/python -m nodeble_wheel --mode manage >> /home/mayongtao/.nodeble-wheel/logs/cron.log 2>&1 # nodeble-wheel
+52 13 * * 1-5 cd /home/mayongtao/projects/nodeble-wheel && /home/mayongtao/projects/nodeble-wheel/.venv/bin/python -m nodeble_wheel --mode scan >> /home/mayongtao/.nodeble-wheel/logs/cron.log 2>&1 # nodeble-wheel
+5 15 * * 1-5 cd /home/mayongtao/projects/nodeble-wheel && /home/mayongtao/projects/nodeble-wheel/.venv/bin/python -m nodeble_wheel --mode manage --force >> /home/mayongtao/.nodeble-wheel/logs/cron.log 2>&1 # nodeble-wheel
+# nodeble_collar cron — module #9
+# Times in ET, weekdays only. Each line invokes `deploy/run-with-fresh-code.sh`
+# which git-pulls origin/main before exec'ing the module, so PR merges land on
+# the next cron tick without manual SSH. See deploy/run-with-fresh-code.sh
+# header for failure-mode policy (log WARNING + continue on pull fail).
+# Placeholders /home/mayongtao/projects/nodeble-collar / /home/mayongtao/.nodeble-collar/logs substituted by deploy.sh.
+43 13 * * 1-5 /home/mayongtao/projects/nodeble-collar/deploy/run-with-fresh-code.sh signal       >> /home/mayongtao/.nodeble-collar/logs/cron.log 2>&1  # nodeble-collar
+53 13 * * 1-5 /home/mayongtao/projects/nodeble-collar/deploy/run-with-fresh-code.sh manage       >> /home/mayongtao/.nodeble-collar/logs/cron.log 2>&1  # nodeble-collar
+03 14 * * 1-5 /home/mayongtao/projects/nodeble-collar/deploy/run-with-fresh-code.sh scan         >> /home/mayongtao/.nodeble-collar/logs/cron.log 2>&1  # nodeble-collar
+36 14 * * 1-5 /home/mayongtao/projects/nodeble-collar/deploy/run-with-fresh-code.sh manage-force >> /home/mayongtao/.nodeble-collar/logs/cron.log 2>&1  # nodeble-collar
