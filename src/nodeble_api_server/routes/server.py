@@ -3,10 +3,17 @@
 Phase A Week 1 stubs per Phase 4.1 contract freeze
 (`~/projects/cto/reviews/2026-04-26-phase-4.1-backend-contract-freeze.md`).
 
-13 endpoints across 5 categories. All return spec-exact shapes so
-UI 总监 frontend can hit real backend (replacing msw mocks). Real
-implementation follows in Week 2-3 (install orchestrator + SSE wiring +
-deploy.sh subprocess invocation per ARCH-18 §2 contract).
+Phase A Week 3 wiring (Path C 5/5 — `2026-05-05-path-c-saas-install-master-spec.md`):
+- ``post_install`` + ``post_update`` schedule ``install_runner.run_install``
+  as background asyncio task; mock 10-step generator removed
+- ``_generate_install_events`` is now a real replay-events.jsonl + tail
+  loop, keyed off the events.jsonl that install_runner writes
+- ``/logs/api-server`` wraps ``journalctl --user`` + reuses
+  ``logs.parse_log_line`` for line shape consistency
+
+Items 4 of dispatch (lifecycle endpoints — pause/resume/uninstall/update
+crontab edits) deferred to next dispatch pending L1 §7.11 #8 cron-edit
+permission carve-out from CEO. Stubs preserved here.
 
 All endpoints require Bearer token (router-level dependency).
 """
@@ -14,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
@@ -26,7 +35,13 @@ from pydantic import BaseModel, Field
 
 from nodeble_api_server.auth import require_bearer_token
 from nodeble_api_server.state_reader import STRATEGY_REGISTRY
-from nodeble_api_server import install_state, tiger_creds, release_manifest
+from nodeble_api_server import (
+    install_runner,
+    install_state,
+    logs as logs_module,
+    release_manifest,
+    tiger_creds,
+)
 
 
 router = APIRouter(
@@ -46,10 +61,80 @@ router = APIRouter(
 _INSTALL_STATE: dict[str, dict] = {}
 _TIGER_CREDS_STUB: dict[str, Any] = {"exists": False, "account": None, "stored_at": None}
 
+# Module-level set holding background install tasks. Without an active
+# reference the asyncio task can be garbage-collected mid-run; this set
+# pins each task until its done-callback removes it.
+_RUNNING_INSTALL_TASKS: set[asyncio.Task] = set()
+
+# Hardcoded api-server systemd --user unit name. Override via env var if
+# the deploy uses a different unit name; verify on first SaaS deploy.
+_API_SERVER_SYSTEMD_UNIT = "api-server.service"
+
 
 def _utc_iso() -> str:
     """ISO 8601 UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_deploy_root(strategy: str) -> Path:
+    """``~/projects/<repo_dir>/`` for the strategy.
+
+    ``repo_dir`` comes from ``state_reader.STRATEGY_REGISTRY`` (e.g.
+    ``"projects/nodeble-wheel"``). ``Path.home()`` resolved per-call so
+    test ``monkeypatch.setattr(Path, 'home', ...)`` works.
+    """
+    meta = STRATEGY_REGISTRY.get(strategy)
+    if not meta:
+        # _validate_strategy below catches this earlier in normal flow.
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy}")
+    return Path.home() / meta["repo_dir"]
+
+
+def _write_install_config(install_id: str, config: dict) -> Path:
+    """Write the config dict as JSON to the install dir (next to state.json).
+
+    Lives in the install_state's per-install dir so it persists for
+    diagnostics + survives api-server restart. Returns the path passed
+    to deploy.sh's ``--config`` flag.
+    """
+    install_dir = (
+        Path.home() / ".nodeble-api" / "data" / "installs" / install_id
+    )
+    install_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = install_dir / "config.json"
+    cfg_path.write_text(json.dumps(config, indent=2))
+    return cfg_path
+
+
+def _spawn_install_runner(
+    install_id: str,
+    strategy: str,
+    config: dict,
+    extra_args: list[str] | None = None,
+) -> None:
+    """Schedule ``install_runner.run_install`` as a background asyncio task.
+
+    Pins the task in ``_RUNNING_INSTALL_TASKS`` so it survives garbage
+    collection until completion. Called from ``post_install`` and
+    ``post_update`` — both are async so an event loop is available.
+    """
+    deploy_root = _resolve_deploy_root(strategy)
+    config_json_path = _write_install_config(install_id, config)
+    cmd = install_runner.build_deploy_cmd(
+        strategy=strategy,
+        config_json_path=config_json_path,
+        deploy_root=deploy_root,
+        extra_args=extra_args,
+    )
+    task = asyncio.create_task(
+        install_runner.run_install(
+            install_id=install_id,
+            cmd=cmd,
+            cwd=deploy_root,
+        )
+    )
+    _RUNNING_INSTALL_TASKS.add(task)
+    task.add_done_callback(_RUNNING_INSTALL_TASKS.discard)
 
 
 # ── Discovery (2 endpoints) ─────────────────────────────────────────────────
@@ -114,22 +199,25 @@ def _validate_strategy(strategy: str) -> None:
 
 
 @router.post("/install/{strategy}", status_code=202)
-def post_install(strategy: str, payload: InstallRequest) -> dict:
-    """Spawn install. Persisted state on disk via install_state module.
+async def post_install(strategy: str, payload: InstallRequest) -> dict:
+    """Spawn install via ``install_runner`` background task. Persisted state on disk.
 
     Per contract §1.2: enforce mode=dry_run server-side regardless of payload
-    (UI 总监 Gap 2 fix). Idempotent: same install_id returns existing.
+    (UI 总监 Gap 2 fix). Idempotent: same install_id returns existing without
+    re-spawning the subprocess (install_state.create returns existing state).
 
     Pre-spawn validation per UI 总监 Bug 1 audit (2026-04-29):
       reuse_tiger_creds=true + Tiger creds NOT on disk → 422 fail-fast
       (was: 202 + subprocess fail at "Resolving Tiger credentials" 30s later =
-      bad UX). Spec amendment to freeze line 144.
+      bad UX).
+
+    Phase A Week 3 wiring (Path C 5/5): post-install_state.create, schedules
+    ``install_runner.run_install`` as background task. SSE stream / status
+    endpoints read events.jsonl + state.json that the runner writes.
     """
     _validate_strategy(strategy)
 
     # Bug 1 gate: reuse_tiger_creds=true requires creds already on disk.
-    # If reuse=false, creds must come in payload.config — that schema check
-    # is Week 2 install_runner concern, not this route stub.
     if payload.reuse_tiger_creds:
         creds = tiger_creds.summary()
         if not creds.get("exists"):
@@ -143,19 +231,32 @@ def post_install(strategy: str, payload: InstallRequest) -> dict:
             )
 
     # CRITICAL — enforce dry_run default per UI 总监 Gap 2 catch
-    # Real impl Week 3: subprocess writes to strategy.yaml before invoking deploy.sh
     config = dict(payload.config)
     config["mode"] = "dry_run"
 
     install_id = payload.install_id
+    # Idempotent: if install_id already exists, returns existing state without
+    # creating a new install dir (so we don't re-spawn the subprocess below).
+    existing = install_state.read(install_id)
     state = install_state.create(
         install_id=install_id,
         strategy=strategy,
         config=config,
     )
+    is_new_install = existing is None
 
     # Mirror to in-memory _INSTALL_STATE for backward-compat with Week 1 tests
     _INSTALL_STATE[install_id] = state
+
+    # Phase A Week 3: spawn the real install_runner subprocess for new installs.
+    # Idempotent re-POSTs of the same install_id do NOT re-spawn (state already
+    # captures the prior run's outcome).
+    if is_new_install:
+        extra_args: list[str] = []
+        if payload.telegram is None:
+            # No Telegram config provided → skip Telegram setup in deploy.sh
+            extra_args.append("--skip-telegram")
+        _spawn_install_runner(install_id, strategy, config, extra_args=extra_args)
 
     return {
         "install_id": install_id,
@@ -201,13 +302,20 @@ class UpdateRequest(BaseModel):
 
 
 @router.post("/update/{strategy}", status_code=202)
-def post_update(strategy: str, payload: UpdateRequest) -> dict:
-    """Update strategy. Reuses install orchestrator with operation='update'.
-    Persisted state on disk via install_state module.
+async def post_update(strategy: str, payload: UpdateRequest) -> dict:
+    """Update strategy. Reuses install_runner with operation='update'.
+
+    Phase A Week 3 wiring: same subprocess pattern as install — invokes
+    ``deploy.sh --non-interactive --config <existing>``. deploy.sh's
+    idempotency contract (§5) handles "already at target version" →
+    ``STATUS: already_installed``. Per-strategy version pinning is
+    deploy.sh's responsibility (read from RESULT_VERSION on prior install
+    or fall through to module's master branch).
     """
     _validate_strategy(strategy)
 
     install_id = payload.install_id
+    existing = install_state.read(install_id)
     state = install_state.create(
         install_id=install_id,
         strategy=strategy,
@@ -215,8 +323,12 @@ def post_update(strategy: str, payload: UpdateRequest) -> dict:
         operation="update",
         target_version=payload.target_version,
     )
+    is_new_update = existing is None
 
     _INSTALL_STATE[install_id] = state
+
+    if is_new_update:
+        _spawn_install_runner(install_id, strategy, config={}, extra_args=["--skip-telegram"])
 
     return {
         "install_id": install_id,
@@ -287,46 +399,37 @@ def get_tiger_creds() -> dict:
 # ── Install observability (3 endpoints) ─────────────────────────────────────
 
 
-def _mock_install_steps() -> list[dict]:
-    """Canned step sequence for Wheel install demo (Phase A Week 1 stub).
-
-    Real Week 2 reads stdout/stderr from deploy.sh subprocess and emits
-    real events. For now this is a deterministic sequence.
-    """
-    return [
-        {"step": "Validating config", "duration_ms": 320},
-        {"step": "Cloning repo", "duration_ms": 1200},
-        {"step": "Setting up venv", "duration_ms": 4500},
-        {"step": "Installing dependencies", "duration_ms": 8000},
-        {"step": "Resolving Tiger credentials", "duration_ms": 200},
-        {"step": "Writing strategy.yaml (mode=dry_run enforced)", "duration_ms": 100},
-        {"step": "Setting up cron jobs", "duration_ms": 300},
-        {"step": "Starting bot service", "duration_ms": 600},
-        {"step": "Smoke test (dry-run scan)", "duration_ms": 5000},
-        {"step": "Install complete", "duration_ms": 100},
-    ]
-
-
 async def _sse_event(event: str, data: dict) -> str:
     """Format SSE event per Phase 4.1 contract §2.1."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+# SSE tail polling — read interval + hard cap. The hard cap matches
+# install_runner's default total budget so a runaway subprocess never
+# leaves an SSE stream open forever; install_runner itself emits a
+# terminal complete on its own timeout, but this is belt-and-suspenders.
+_SSE_TAIL_POLL_INTERVAL_S = 0.5
+_SSE_TAIL_MAX_WAIT_S = 660  # install_runner budget 600s + 60s slack
+
+
 async def _generate_install_events(install_id: str):
-    """Async generator yielding install progress events.
+    """Async generator yielding install progress events from events.jsonl.
 
-    Phase A Week 2: uses install_state persistence — events appended to
-    events.jsonl + state.json updated. SSE replay-friendly.
+    Phase A Week 3 (Path C 5/5): the events.jsonl file is the single
+    source of truth, written exclusively by ``install_runner`` running
+    as a background asyncio task spawned by ``post_install`` /
+    ``post_update``. This generator is a pure consumer: replays whatever's
+    already there, then polls for new entries until either a terminal
+    ``complete`` event arrives OR the hard wait cap is hit.
 
-    Real Week 3 wires to subprocess stdout. For now, deterministic 10-step
-    Wheel install simulation, ~3s total wall-clock.
+    Late subscribers / SSE reconnects: full replay first so the client
+    catches up to the current state, then live tail.
 
-    Replay: if events.jsonl already has events (install was started earlier
-    + reconnecting), replay those first before generating new ones.
+    Unknown install_id: synthetic ``complete`` with status=failed so the
+    UI can render an error state instead of hanging.
     """
     state = install_state.read(install_id)
     if state is None:
-        # Late subscribers / unknown install_id — emit synthesized 'unknown' completion
         yield await _sse_event("complete", {
             "status": "failed",
             "duration_ms": 0,
@@ -335,69 +438,53 @@ async def _generate_install_events(install_id: str):
         })
         return
 
-    # Replay any previously-persisted events first (SSE reconnect / late subscriber)
-    replayed = 0
+    # Phase 1: replay everything already persisted.
+    seen_count = 0
+    saw_complete = False
     for event in install_state.replay_events(install_id):
         yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
-        replayed += 1
+        seen_count += 1
+        if event["event"] == "complete":
+            saw_complete = True
+            return
 
-    # If install already terminal (success/failed/cancelled) AND we have events
-    # → replay and stop. Don't re-run the simulation.
-    if state.get("status") in install_state.TERMINAL_STATUSES and replayed > 0:
+    # If state is already terminal but no complete event in jsonl (edge case
+    # from prior shipped runs without complete event), synthesize one.
+    if not saw_complete and state.get("status") in install_state.TERMINAL_STATUSES:
+        yield await _sse_event("complete", {
+            "status": state["status"],
+            "duration_ms": 0,
+            "error": state.get("error"),
+            "ts": state.get("completed_at") or _utc_iso(),
+        })
         return
 
-    # Otherwise generate canned events (Week 2 stub — Week 3 swaps for subprocess)
-    install_state.update_state(install_id, status="running")
-    started_t = time.monotonic()
-    steps = _mock_install_steps()
+    # Phase 2: tail the events.jsonl until terminal complete OR max wait.
+    # Polling at 0.5s is fine for install UX (install steps take seconds-
+    # to-minutes); reduces complexity vs inotify or aiofiles tailing.
+    waited_s = 0.0
+    while waited_s < _SSE_TAIL_MAX_WAIT_S:
+        await asyncio.sleep(_SSE_TAIL_POLL_INTERVAL_S)
+        waited_s += _SSE_TAIL_POLL_INTERVAL_S
+        all_events = list(install_state.replay_events(install_id))
+        new_events = all_events[seen_count:]
+        for event in new_events:
+            yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
+            seen_count += 1
+            if event["event"] == "complete":
+                return
 
-    for step_def in steps:
-        step_name = step_def["step"]
-        in_prog_event = {
-            "step": step_name,
-            "status": "in_progress",
-            "ts": _utc_iso(),
-        }
-        install_state.update_state(install_id, current_step=step_name)
-        install_state.append_event(install_id, event_type="step", payload=in_prog_event)
-        yield await _sse_event("step", in_prog_event)
-
-        # Cap at 300ms in stub so frontend dev iteration is fast
-        await asyncio.sleep(min(step_def["duration_ms"] / 1000.0, 0.3))
-
-        ok_event = {
-            "step": step_name,
-            "status": "ok",
-            "duration_ms": step_def["duration_ms"],
-            "ts": _utc_iso(),
-        }
-        install_state.update_state(
-            install_id,
-            steps_completed_append=ok_event,
-            log_tail_append={
-                "level": "info",
-                "message": f"Step '{step_name}' completed in {step_def['duration_ms']}ms",
-                "ts": ok_event["ts"],
-            },
-        )
-        install_state.append_event(install_id, event_type="step", payload=ok_event)
-        yield await _sse_event("step", ok_event)
-
-    # Final 'complete' event
-    completed_at = _utc_iso()
-    elapsed_ms = int((time.monotonic() - started_t) * 1000)
-    complete_event = {
-        "status": "success",
-        "duration_ms": elapsed_ms,
-        "ts": completed_at,
-    }
-    install_state.update_state(
-        install_id,
-        status="success",
-        completed_at=completed_at,
-    )
-    install_state.append_event(install_id, event_type="complete", payload=complete_event)
-    yield await _sse_event("complete", complete_event)
+    # Hard timeout — install_runner's own budget should have fired by now.
+    # Emit a synthetic timeout to unstick the UI.
+    yield await _sse_event("complete", {
+        "status": "failed",
+        "duration_ms": int(_SSE_TAIL_MAX_WAIT_S * 1000),
+        "error": (
+            f"SSE stream exceeded {int(_SSE_TAIL_MAX_WAIT_S)}s wait without "
+            "terminal event — check install_runner subprocess state"
+        ),
+        "ts": _utc_iso(),
+    })
 
 
 @router.get("/install/{install_id}/stream")
@@ -459,28 +546,128 @@ def get_install_log(install_id: str) -> PlainTextResponse:
 # ── Server logs (1 endpoint) ────────────────────────────────────────────────
 
 
+# journalctl PRIORITY → our 3-level taxonomy.
+# Per `man systemd.journal-fields`: 0=emerg, 1=alert, 2=crit, 3=err,
+# 4=warning, 5=notice, 6=info, 7=debug. We collapse to error/warn/info.
+_JOURNALCTL_PRIORITY_TO_LEVEL = {
+    "0": "error", "1": "error", "2": "error", "3": "error",
+    "4": "warn",
+    "5": "info", "6": "info", "7": "info",
+}
+
+# Map our 3-level taxonomy to journalctl's `-p` filter (max priority).
+# `-p info` shows priorities 0-6 (everything except debug); `-p warn`
+# shows 0-4; `-p err` shows 0-3. This matches "show this severity AND
+# above" semantics that frontend operators expect.
+_LEVEL_TO_JOURNALCTL_PRIORITY = {
+    "info": "info",
+    "warn": "warning",
+    "error": "err",
+}
+
+
+def _journalctl_record_to_log_line(record: dict) -> dict:
+    """Map one journalctl `-o json` record dict to {ts, level, message}.
+
+    journalctl json fields:
+      - ``__REALTIME_TIMESTAMP``: microseconds since epoch (string)
+      - ``MESSAGE``: log text
+      - ``PRIORITY``: syslog priority "0"-"7"
+    """
+    ts_us = record.get("__REALTIME_TIMESTAMP")
+    ts_iso: str | None = None
+    if ts_us:
+        try:
+            ts_iso = datetime.fromtimestamp(
+                int(ts_us) / 1_000_000, tz=timezone.utc,
+            ).isoformat()
+        except (ValueError, TypeError):
+            ts_iso = None
+    priority = record.get("PRIORITY", "6")
+    level = _JOURNALCTL_PRIORITY_TO_LEVEL.get(str(priority), "info")
+    message = record.get("MESSAGE", "")
+    if isinstance(message, list):
+        # journalctl renders bytes-typed messages as int arrays; coerce to str.
+        try:
+            message = bytes(message).decode("utf-8", errors="replace")
+        except Exception:
+            message = repr(message)
+    return {"ts": ts_iso, "level": level, "message": message}
+
+
 @router.get("/logs/api-server")
 def get_api_server_logs(lines: int = 200, level: str | None = None) -> dict:
-    """Recent api-server systemd journal lines.
+    """Recent api-server systemd journal lines (Phase A Week 3 — real wiring).
 
-    Phase A Week 1 stub: returns canned recent events. Real Week 2
-    invokes journalctl + parses.
+    Invokes ``journalctl --user -u <unit> -n <lines> -o json [-p <priority>]``
+    and parses the JSON-stream output line-by-line. Each record is mapped to
+    the same ``{ts, level, message}`` shape the Phase A Week 1 stub returned,
+    so frontend doesn't need a migration.
+
+    Failure modes:
+      - ``journalctl`` binary missing on host (e.g. macOS dev box) → 200
+        with empty lines + ``source="journalctl_unavailable"`` so UI can
+        show "logs unavailable" state cleanly.
+      - subprocess exit non-zero → 500 with stderr tail.
+      - subprocess timeout (5s) → 504.
     """
     if lines < 1 or lines > 500:
         raise HTTPException(status_code=400, detail="lines must be 1-500")
     if level is not None and level not in ("info", "warn", "error"):
         raise HTTPException(status_code=400, detail="level must be info|warn|error")
 
-    # Stub canned data — real impl Week 2
-    canned = [
-        {"ts": _utc_iso(), "level": "info", "message": "api-server started"},
-        {"ts": _utc_iso(), "level": "info", "message": "Bearer auth middleware active"},
-        {"ts": _utc_iso(), "level": "info", "message": "Phase A Week 1 server stubs serving (this is a stub log line)"},
+    if shutil.which("journalctl") is None:
+        return {
+            "lines": [],
+            "total_returned": 0,
+            "source": "journalctl_unavailable",
+        }
+
+    args = [
+        "journalctl", "--user", "-u", _API_SERVER_SYSTEMD_UNIT,
+        "-n", str(lines), "-o", "json", "--no-pager",
     ]
     if level:
-        canned = [e for e in canned if e["level"] == level]
+        args.extend(["-p", _LEVEL_TO_JOURNALCTL_PRIORITY[level]])
+
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="journalctl timed out (>5s)")
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"journalctl failed: {exc}")
+
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"journalctl exited {result.returncode}: {result.stderr[-200:].strip()}",
+        )
+
+    parsed_lines: list[dict] = []
+    for raw in result.stdout.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError:
+            # Defensive: journalctl sometimes emits non-JSON on truncated
+            # records. Reuse logs.parse_log_line for free-form fallback.
+            parsed = logs_module.parse_log_line(raw)
+            parsed_lines.append({
+                "ts": parsed.get("ts"),
+                "level": (parsed.get("level") or "info").lower(),
+                "message": parsed.get("message") or raw,
+            })
+            continue
+        if not isinstance(record, dict):
+            continue
+        parsed_lines.append(_journalctl_record_to_log_line(record))
+
     return {
-        "lines": canned[-lines:],
-        "total_returned": min(len(canned), lines),
-        "source": "stub_phase_a_week1",
+        "lines": parsed_lines[-lines:],
+        "total_returned": min(len(parsed_lines), lines),
+        "source": "journalctl_user",
     }

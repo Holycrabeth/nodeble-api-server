@@ -155,12 +155,20 @@ def update_state(
     log_tail_append: dict | None = None,
     completed_at: str | None = None,
     error: str | None = None,
+    result_metadata_merge: dict | None = None,
     home: Path | None = None,
 ) -> dict | None:
     """Patch state.json for install_id.
 
     Reads current state, applies updates, atomic-writes back.
     Returns updated state, or None if install_id not found.
+
+    Phase A Week 3 (Path C 5/5): ``result_metadata_merge`` accepts a dict
+    of ``RESULT_<KEY>: <value>`` pairs collected from deploy.sh stdout per
+    `~/projects/cto/reviews/2026-05-05-deploy-sh-non-interactive-contract.md`
+    §4.5. Shallow-merges into ``state["result_metadata"]`` (creates the key
+    if absent — backward-compat with state.json files written before this
+    field was added).
     """
     state = read(install_id, home=home)
     if state is None:
@@ -180,6 +188,10 @@ def update_state(
         state["completed_at"] = completed_at
     if error is not None:
         state["error"] = error
+    if result_metadata_merge is not None:
+        existing = state.get("result_metadata") or {}
+        existing.update(result_metadata_merge)
+        state["result_metadata"] = existing
 
     state_path = _resolve_install_dir(install_id, home) / "state.json"
     _atomic_write_json(state_path, state)

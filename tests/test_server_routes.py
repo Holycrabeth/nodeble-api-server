@@ -1,36 +1,35 @@
-"""Tests for /api/v1/server/* routes — Phase A Week 1 stubs.
+"""Tests for /api/v1/server/* routes — Phase A Week 1 stubs + Week 3 wiring.
 
 Per Phase 4.1 contract freeze
-(`~/projects/cto/reviews/2026-04-26-phase-4.1-backend-contract-freeze.md`).
+(`~/projects/cto/reviews/2026-04-26-phase-4.1-backend-contract-freeze.md`)
++ Phase A Week 3 wiring (Path C 5/5
+`2026-05-05-path-c-saas-install-master-spec.md`).
 
-13 endpoints across 5 categories — discovery / lifecycle / Tiger creds /
-install observability / server logs. These tests pin SHAPE conformance
-(real impl Week 2 swaps stubs but must keep shapes for UI 总监 frontend).
-
-What we lock down:
+What we lock down (shape + behavior):
   - 200/202/404/400 status codes per spec
   - response key presence + types
-  - install_id idempotency (POST same id twice returns existing)
+  - install_id idempotency (POST same id twice returns existing AND does
+    NOT re-spawn subprocess)
   - mode=dry_run server-side enforcement (Gap 2 fix)
   - SSE event format (event: ... \\ndata: {...}\\n\\n)
   - auth required (401 without Bearer)
-
-What we do NOT test (yet — real impl Week 2):
-  - actual subprocess invocation
-  - persistent state across api-server restart
-  - Tiger creds storage to disk
-  - real journalctl / log fetch
+  - Phase A Week 3: ``post_install`` schedules ``install_runner.run_install``
+    with correct argv (bash + deploy.sh + --non-interactive + config + flags)
+  - Phase A Week 3: ``/logs/api-server`` invokes ``journalctl --user`` and
+    parses JSON output; degrades gracefully when journalctl is missing
 """
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from nodeble_api_server import config, state_reader
+from nodeble_api_server import config, install_state, state_reader
 from nodeble_api_server.app import app
 from nodeble_api_server.routes import server as server_mod
 
@@ -42,15 +41,48 @@ def _hdr() -> dict:
     return {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
+# Phase A Week 3 — captured args for tests that verify install_runner wiring.
+# Each test gets a fresh list via the client fixture.
+_RUN_INSTALL_INVOCATIONS: list[dict] = []
+
+
+async def _noop_run_install(*, install_id, cmd, cwd=None, env=None,
+                             total_budget_ms=600_000, home=None):
+    """Test replacement for install_runner.run_install.
+
+    Records its invocation args + writes a synthetic 'complete' event to
+    events.jsonl so the SSE replay-then-tail generator can finish without
+    waiting for a real subprocess.
+    """
+    _RUN_INSTALL_INVOCATIONS.append({
+        "install_id": install_id,
+        "cmd": list(cmd),
+        "cwd": str(cwd) if cwd is not None else None,
+    })
+    install_state.update_state(
+        install_id, status="success", completed_at="test-ts", home=home,
+    )
+    install_state.append_event(
+        install_id,
+        event_type="complete",
+        payload={"status": "success", "duration_ms": 0, "ts": "test-ts"},
+        home=home,
+    )
+    return {"status": "success", "duration_ms": 0, "ts": "test-ts"}
+
+
 @pytest.fixture(autouse=True)
 def _reset_install_state():
     """Clear in-memory install state between tests (stub state isn't persisted)."""
     server_mod._INSTALL_STATE.clear()
     server_mod._TIGER_CREDS_STUB = {"exists": False, "account": None, "stored_at": None}
+    server_mod._RUNNING_INSTALL_TASKS.clear()
+    _RUN_INSTALL_INVOCATIONS.clear()
     state_reader.clear_cache()
     yield
     server_mod._INSTALL_STATE.clear()
     server_mod._TIGER_CREDS_STUB = {"exists": False, "account": None, "stored_at": None}
+    server_mod._RUNNING_INSTALL_TASKS.clear()
 
 
 @pytest.fixture
@@ -62,6 +94,13 @@ def client(tmp_path: Path, monkeypatch):
     }))
     monkeypatch.setattr(config, "DEFAULT_CONFIG_PATH", cfg_path)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    # Phase A Week 3: replace install_runner.run_install with a no-op that
+    # writes a synthetic complete event. Prevents tests from spawning real
+    # bash subprocesses (which would fail anyway since deploy.sh paths are
+    # under tmp_path/projects/* — empty).
+    monkeypatch.setattr(server_mod.install_runner, "run_install", _noop_run_install)
+
     return TestClient(app)
 
 
@@ -492,3 +531,226 @@ def test_server_logs_filter_by_level(client):
     body = r.json()
     for line in body["lines"]:
         assert line["level"] == "info"
+
+
+# ── Phase A Week 3 wiring tests (install_runner spawn + journalctl) ─────────
+
+
+def test_install_spawns_install_runner_with_correct_cmd(client, tmp_path):
+    """POST /install schedules install_runner.run_install with bash + deploy.sh
+    --non-interactive --config <path> + extra args."""
+    _put_creds(client)
+    r = client.post(
+        "/api/v1/server/install/wheel",
+        headers=_hdr(),
+        json={"install_id": "phase-a-w3-1", "config": {"capital_usd": 50000}},
+    )
+    assert r.status_code == 202
+    # The no-op fixture captures invocations
+    assert len(_RUN_INSTALL_INVOCATIONS) == 1
+    inv = _RUN_INSTALL_INVOCATIONS[0]
+    assert inv["install_id"] == "phase-a-w3-1"
+    assert inv["cmd"][0] == "bash"
+    assert inv["cmd"][1].endswith("/deploy/deploy.sh")
+    # repo_dir for wheel is "projects/nodeble-wheel" per state_reader.STRATEGY_REGISTRY
+    assert "nodeble-wheel" in inv["cmd"][1]
+    assert "--non-interactive" in inv["cmd"]
+    assert "--config" in inv["cmd"]
+    # No telegram in payload → --skip-telegram appended
+    assert "--skip-telegram" in inv["cmd"]
+
+
+def test_install_telegram_present_omits_skip_flag(client):
+    """payload.telegram set → don't append --skip-telegram."""
+    _put_creds(client)
+    r = client.post(
+        "/api/v1/server/install/wheel",
+        headers=_hdr(),
+        json={
+            "install_id": "phase-a-w3-tg",
+            "config": {},
+            "telegram": {"bot_token": "x", "chat_id": "y"},
+        },
+    )
+    assert r.status_code == 202
+    inv = _RUN_INSTALL_INVOCATIONS[0]
+    assert "--skip-telegram" not in inv["cmd"]
+
+
+def test_install_idempotent_does_not_double_spawn(client):
+    """Two POSTs with same install_id → install_runner.run_install called ONCE."""
+    _put_creds(client)
+    body = {"install_id": "phase-a-w3-idem", "config": {}}
+    r1 = client.post("/api/v1/server/install/wheel", headers=_hdr(), json=body)
+    assert r1.status_code == 202
+    assert len(_RUN_INSTALL_INVOCATIONS) == 1
+    # Second POST: same install_id, same shape — no new subprocess spawn
+    r2 = client.post("/api/v1/server/install/wheel", headers=_hdr(), json=body)
+    assert r2.status_code == 202
+    assert len(_RUN_INSTALL_INVOCATIONS) == 1, (
+        "idempotency violated — same install_id re-spawned subprocess"
+    )
+
+
+def test_install_writes_config_json_to_install_dir(client, tmp_path):
+    """post_install writes payload.config (with mode=dry_run injected) to
+    ``<install_dir>/config.json`` for deploy.sh --config."""
+    _put_creds(client)
+    client.post(
+        "/api/v1/server/install/wheel",
+        headers=_hdr(),
+        json={"install_id": "phase-a-w3-cfg", "config": {"capital_usd": 50000}},
+    )
+    cfg_path = tmp_path / ".nodeble-api" / "data" / "installs" / "phase-a-w3-cfg" / "config.json"
+    assert cfg_path.exists()
+    written = json.loads(cfg_path.read_text())
+    assert written["mode"] == "dry_run"  # server-side enforcement
+    assert written["capital_usd"] == 50000
+
+
+def test_update_spawns_install_runner_with_skip_telegram(client):
+    """POST /update reuses install_runner; no telegram by default."""
+    r = client.post(
+        "/api/v1/server/update/wheel",
+        headers=_hdr(),
+        json={"install_id": "phase-a-w3-upd", "target_version": "0.7.3"},
+    )
+    assert r.status_code == 202
+    assert len(_RUN_INSTALL_INVOCATIONS) == 1
+    inv = _RUN_INSTALL_INVOCATIONS[0]
+    assert inv["install_id"] == "phase-a-w3-upd"
+    assert "--skip-telegram" in inv["cmd"]
+
+
+def test_install_stream_replays_complete_event_from_jsonl(client):
+    """SSE generator yields the no-op-fixture's complete event."""
+    _put_creds(client)
+    client.post(
+        "/api/v1/server/install/wheel",
+        headers=_hdr(),
+        json={"install_id": "phase-a-w3-sse", "config": {}},
+    )
+    # No-op fixture's run_install completes synchronously, writes complete event
+    with client.stream(
+        "GET", "/api/v1/server/install/phase-a-w3-sse/stream", headers=_hdr(),
+    ) as r:
+        body = b""
+        for chunk in r.iter_bytes():
+            body += chunk
+            if b"complete" in body:
+                break
+        text = body.decode()
+    assert "event: complete" in text
+    assert "success" in text
+
+
+# ── /logs/api-server (journalctl wiring) ────────────────────────────────────
+
+
+def test_logs_api_server_journalctl_unavailable_returns_empty(client, monkeypatch):
+    """When journalctl binary not on PATH → 200 with empty lines + tagged source."""
+    monkeypatch.setattr(server_mod.shutil, "which", lambda _: None)
+    r = client.get("/api/v1/server/logs/api-server", headers=_hdr())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["lines"] == []
+    assert body["source"] == "journalctl_unavailable"
+
+
+def test_logs_api_server_journalctl_success_passthrough(client, monkeypatch):
+    """journalctl returns JSON-stream output → parsed into {ts, level, message}."""
+    sample = (
+        '{"__REALTIME_TIMESTAMP":"1714900000000000","MESSAGE":"hello","PRIORITY":"6"}\n'
+        '{"__REALTIME_TIMESTAMP":"1714900001000000","MESSAGE":"warn-line","PRIORITY":"4"}\n'
+        '{"__REALTIME_TIMESTAMP":"1714900002000000","MESSAGE":"err-line","PRIORITY":"3"}\n'
+    )
+
+    def fake_run(args, **kw):
+        # Verify cmd shape
+        assert args[0] == "journalctl"
+        assert "--user" in args
+        assert "-u" in args
+        assert "-o" in args and "json" in args
+        return subprocess.CompletedProcess(args, 0, stdout=sample, stderr="")
+
+    monkeypatch.setattr(server_mod.shutil, "which", lambda _: "/usr/bin/journalctl")
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    r = client.get("/api/v1/server/logs/api-server", headers=_hdr())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source"] == "journalctl_user"
+    assert body["total_returned"] == 3
+    levels = [line["level"] for line in body["lines"]]
+    assert levels == ["info", "warn", "error"]
+
+
+def test_logs_api_server_invokes_priority_flag_for_level(client, monkeypatch):
+    """level=warn → journalctl args include `-p warning`."""
+    captured = {}
+
+    def fake_run(args, **kw):
+        captured["args"] = list(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(server_mod.shutil, "which", lambda _: "/usr/bin/journalctl")
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    client.get("/api/v1/server/logs/api-server?level=warn", headers=_hdr())
+    assert "-p" in captured["args"]
+    p_idx = captured["args"].index("-p")
+    assert captured["args"][p_idx + 1] == "warning"
+
+
+def test_logs_api_server_timeout_504(client, monkeypatch):
+    monkeypatch.setattr(server_mod.shutil, "which", lambda _: "/usr/bin/journalctl")
+
+    def fake_run(args, **kw):
+        raise subprocess.TimeoutExpired(args, 5)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+    r = client.get("/api/v1/server/logs/api-server", headers=_hdr())
+    assert r.status_code == 504
+
+
+def test_logs_api_server_subprocess_nonzero_500(client, monkeypatch):
+    monkeypatch.setattr(server_mod.shutil, "which", lambda _: "/usr/bin/journalctl")
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="unit not found")
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+    r = client.get("/api/v1/server/logs/api-server", headers=_hdr())
+    assert r.status_code == 500
+    assert "unit not found" in r.json()["detail"]
+
+
+def test_logs_api_server_parse_record_handles_missing_fields(client, monkeypatch):
+    """Defensive: journalctl record without PRIORITY → defaults to info."""
+    sample = '{"__REALTIME_TIMESTAMP":"1714900000000000","MESSAGE":"hi"}\n'
+    monkeypatch.setattr(server_mod.shutil, "which", lambda _: "/usr/bin/journalctl")
+    monkeypatch.setattr(
+        server_mod.subprocess, "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, stdout=sample, stderr=""),
+    )
+    r = client.get("/api/v1/server/logs/api-server", headers=_hdr())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["lines"][0]["level"] == "info"
+    assert body["lines"][0]["message"] == "hi"
+
+
+def test_logs_api_server_non_json_line_falls_back_to_logs_parser(client, monkeypatch):
+    """Defensive: non-JSON line → reuse logs.parse_log_line for free-form fallback."""
+    sample = "not json at all — just bare text\n"
+    monkeypatch.setattr(server_mod.shutil, "which", lambda _: "/usr/bin/journalctl")
+    monkeypatch.setattr(
+        server_mod.subprocess, "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, stdout=sample, stderr=""),
+    )
+    r = client.get("/api/v1/server/logs/api-server", headers=_hdr())
+    assert r.status_code == 200
+    body = r.json()
+    # logs.parse_log_line returns None for unparseable; fallback uses raw text
+    assert len(body["lines"]) == 1
+    assert "not json" in body["lines"][0]["message"]
