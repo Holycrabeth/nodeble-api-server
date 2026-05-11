@@ -1,0 +1,71 @@
+name: shellcheck
+
+# Phase F''' CI gate per ratified spec ~/projects/cto/reviews/2026-05-05-
+# bootstrap-sh-design.md §10 #2 ("Run shellcheck on bootstrap.sh in CTO
+# local — should pass"). v1 enforces this in CI so every PR + push to
+# main gets a clean signal before any consumer (Tauri Phase F' russh
+# client) fetches the URL.
+#
+# Scope: lint `scripts/*.sh` + `tests/integration/*.sh`. install.sh
+# (legacy interactive installer at repo root) intentionally NOT linted
+# in this gate — it predates the STEP/STATUS contract + has known
+# shellcheck warnings that would mask new regressions on the
+# bootstrap.sh path. Lint it in a separate workflow if/when migrated.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**.sh'
+      - 'tests/integration/**.sh'
+      - '.github/workflows/shellcheck.yml'
+  pull_request:
+    paths:
+      - 'scripts/**.sh'
+      - 'tests/integration/**.sh'
+      - '.github/workflows/shellcheck.yml'
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -y && sudo apt-get install -y shellcheck
+
+      - name: Lint scripts/bootstrap.sh
+        run: shellcheck -x scripts/bootstrap.sh
+
+      - name: Lint tests/integration/*.sh
+        run: |
+          # Test fixtures are bash with the same strictness as production
+          # scripts. -e: enable optional checks for better signal/noise.
+          shellcheck -x tests/integration/*.sh
+
+  bash-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n on bootstrap.sh + integration tests
+        run: |
+          bash -n scripts/bootstrap.sh
+          for f in tests/integration/*.sh; do
+            bash -n "$f"
+          done
+
+  integration-tests:
+    # Optional gate — runs the Docker-based bootstrap.sh integration
+    # matrix. Container OS images + apt update can be slow; allow up
+    # to 30 min. If runner can't access Docker daemon (rare on
+    # GitHub Actions ubuntu-latest), the test script exits 0 with a
+    # SKIP message so the gate doesn't false-fail.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [shellcheck, bash-syntax]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run integration test matrix
+        run: bash tests/integration/test_bootstrap.sh
