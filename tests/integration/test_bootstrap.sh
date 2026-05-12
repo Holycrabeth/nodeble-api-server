@@ -69,7 +69,7 @@ emit_fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 # name on stdout. The caller is responsible for `docker rm -f` cleanup.
 spin_container() {
     local distro="$1"
-    local name="bootstrap-test-$(echo "$distro" | tr ':/' '--')"
+    local name; name="bootstrap-test-$(echo "$distro" | tr ':/' '--')"
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker run -d --name "$name" "$distro" sleep infinity >/dev/null
     docker cp "$BOOTSTRAP_SH" "$name:/tmp/bootstrap.sh"
