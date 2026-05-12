@@ -30,6 +30,14 @@
 #   STATUS: already_installed         terminal — existing install reused
 #   STATUS: failure: <reason>         terminal failure (exit 1)
 #   STATUS: dry_run_ok                terminal — --dry-run smoke
+#                                       (developer/CI only; NOT consumed
+#                                       by Tauri parser, which invokes
+#                                       bootstrap.sh WITHOUT --dry-run.
+#                                       Parser's parse_status_payload
+#                                       defensive-treats unknown STATUS
+#                                       payloads as Failure; dry_run_ok
+#                                       only reached via local invocation
+#                                       e.g. tests/integration/test_bootstrap.sh.)
 #
 # Spec source: ~/projects/cto/reviews/2026-05-05-bootstrap-sh-design.md
 # (ratified 5/5 with A1-A5 amendments; verify-from-source 5/11).
@@ -87,7 +95,14 @@ while [ $# -gt 0 ]; do
             exit 0
             ;;
         *)
-            echo "STEP: arg-parse ✗ unknown flag: $1" >&2
+            # STEP line MUST go to stdout (not stderr) — parser-clean
+            # stdout contract per header lines 21-32 + stream.rs
+            # LineStreamer wire grammar. Tauri russh wire-impl (Phase F'
+            # chunk 3+) routes stdout chunks through LineStreamer::push;
+            # stderr chunks are reserved for future ExtendedData routing
+            # and currently get dropped, so a stderr-routed STEP line
+            # would never reach the SetupWizard step-chip UI.
+            echo "STEP: arg-parse ✗ unknown flag: $1"
             echo "STATUS: failure: bad_args"
             exit 2
             ;;

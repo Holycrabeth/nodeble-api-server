@@ -69,7 +69,7 @@ emit_fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 # name on stdout. The caller is responsible for `docker rm -f` cleanup.
 spin_container() {
     local distro="$1"
-    local name="bootstrap-test-$(echo "$distro" | tr ':/' '--')"
+    local name; name="bootstrap-test-$(echo "$distro" | tr ':/' '--')"
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker run -d --name "$name" "$distro" sleep infinity >/dev/null
     docker cp "$BOOTSTRAP_SH" "$name:/tmp/bootstrap.sh"
@@ -118,23 +118,41 @@ test_help() {
 
 
 # ── Test 3: bad-flag → exit 2 + STATUS: failure: bad_args ──────────────
+#
+# Also verifies the LineStreamer parser-clean stdout contract: both the
+# STEP fail marker and the terminal STATUS line MUST land on stdout, NOT
+# stderr (the Tauri russh wire-impl currently drops stderr chunks; a
+# stderr-routed STEP would never reach the SetupWizard step-chip UI).
+# This test was tightened 5/12 after Bootstrap Dev LineStreamer contract
+# validation audit caught a stderr-routed STEP line on the bad-args path.
 
 test_bad_flag() {
-    echo "=== Test 3: --bogus → exit 2 + bad_args ==="
+    echo "=== Test 3: --bogus → exit 2 + bad_args + stdout-clean ==="
     for distro in "${DISTROS[@]}"; do
         local name
         name=$(spin_container "$distro")
-        local out="$LOG_DIR/badflag-$distro.txt"
+        local out_stdout="$LOG_DIR/badflag-$distro.stdout.txt"
+        local out_stderr="$LOG_DIR/badflag-$distro.stderr.txt"
+        # Separate stdout vs stderr so we can assert the parser-clean
+        # contract: STEP/STATUS/RESULT_* land on stdout only.
         # Set +e so the failing exec doesn't kill our test driver.
         set +e
-        docker exec "$name" bash /tmp/bootstrap.sh --bogus >"$out" 2>&1
+        docker exec "$name" bash /tmp/bootstrap.sh --bogus \
+            >"$out_stdout" 2>"$out_stderr"
         local rc=$?
         set -e
-        if [ "$rc" -eq 2 ] && grep -q "STATUS: failure: bad_args" "$out"; then
-            emit_pass "$distro: bad-flag exit 2 + STATUS: bad_args"
+        if [ "$rc" -eq 2 ] \
+            && grep -q "STEP: arg-parse ✗" "$out_stdout" \
+            && grep -q "STATUS: failure: bad_args" "$out_stdout" \
+            && ! grep -q "STEP: arg-parse ✗" "$out_stderr" \
+            && ! grep -q "STATUS: failure: bad_args" "$out_stderr"; then
+            emit_pass "$distro: bad-flag exit 2 + STEP+STATUS on stdout (no stderr leak)"
         else
-            emit_fail "$distro: bad-flag rc=$rc, output mismatch"
-            cat "$out" >&2
+            emit_fail "$distro: bad-flag rc=$rc, STEP/STATUS contract drift"
+            echo "  stdout:" >&2
+            cat "$out_stdout" >&2
+            echo "  stderr:" >&2
+            cat "$out_stderr" >&2
         fi
         docker rm -f "$name" >/dev/null 2>&1 || true
     done
