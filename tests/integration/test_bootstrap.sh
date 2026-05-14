@@ -47,9 +47,14 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 # Distros to test. Order = small → large.
+# ubuntu:25.10 (questing) added 5/14 per Yongtao P0 T-20260514-150707 —
+# bootstrap.sh must work on ANY Ubuntu release including dev releases.
+# questing's deadsnakes PPA returns 404; bootstrap.sh Attempt 2
+# (system python3 ≥ 3.12 symlinked as python3.12) handles it.
 DISTROS=(
     "ubuntu:22.04"
     "ubuntu:24.04"
+    "ubuntu:25.10"
     "debian:12"
 )
 
@@ -196,6 +201,75 @@ test_dry_run() {
 }
 
 
+# ── Test 6: python-install fallback succeeds on each supported Ubuntu ──
+#
+# Verifies bootstrap.sh `install_python_if_needed` reaches its success
+# emit on all 3 Ubuntu distros incl. ubuntu:25.10 questing (Yongtao 5/14
+# P0 T-20260514-150707 — non-LTS support). Bootstrap will die LATER at
+# enable-linger (no systemd in plain containers), but `STEP:
+# python-install ✓` must appear BEFORE the failure — that's our gate.
+#
+# Expected fallback paths per distro:
+#   ubuntu:22.04 → Attempt 3 (deadsnakes PPA; system python3=3.10 < 3.12)
+#   ubuntu:24.04 → Attempt 1 (main repos; python3.12 in 24.04 main)
+#   ubuntu:25.10 → Attempt 2 (system python3=3.13 symlinked as python3.12;
+#                  deadsnakes PPA returns 404 on questing)
+#
+# debian:12 is excluded here — bootstrap.sh intentionally dies at
+# python-install on Debian (debian_needs_python312_manual) per CTO spec
+# §13 + L2 CLAUDE.md "Ubuntu 22.04+ only" rejection. Existing tests 1-4
+# still cover debian:12 syntax/help/bogus/dry-run.
+
+PYINSTALL_DISTROS=(
+    "ubuntu:22.04"
+    "ubuntu:24.04"
+    "ubuntu:25.10"
+)
+
+test_python_install() {
+    echo "=== Test 6: python-install fallback (Yongtao 5/14 non-LTS support) ==="
+    for distro in "${PYINSTALL_DISTROS[@]}"; do
+        local name
+        name=$(spin_container "$distro")
+        # Pre-install tooling. software-properties-common is needed by
+        # bootstrap.sh Attempt 3 (deadsnakes) — provides add-apt-repository.
+        # `-e DEBIAN_FRONTEND=noninteractive` prevents apt from prompting on
+        # tzdata / libc6 service restart / etc. (would otherwise hang the
+        # docker exec waiting for stdin input that never arrives via the
+        # CI runner's non-tty exec session — surfaced 5/14 CI cancellation).
+        docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+            apt-get update -y >/dev/null 2>&1 || true
+        docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+            apt-get install -y curl git openssl sudo software-properties-common \
+            >/dev/null 2>&1 || true
+        local out="$LOG_DIR/python-install-${distro//[:.]/_}.txt"
+        # `timeout 600` defensive cap — if a distro hangs unexpectedly,
+        # this iteration fails fast and the test reports it explicitly
+        # rather than running out the GHA 30-min job budget silently.
+        # Set +e — we don't gate on overall exit (script will die at
+        # enable-linger downstream; we just check the python-install
+        # step marker.)
+        set +e
+        timeout 600 docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+            bash /tmp/bootstrap.sh > "$out" 2>&1
+        local rc=$?
+        set -e
+        if grep -q "^STEP: python-install ✓" "$out"; then
+            local detail
+            detail=$(grep "^STEP: python-install ✓" "$out" | head -1 | sed 's|^STEP: python-install ✓ *||')
+            emit_pass "$distro: python-install ✓ ($detail)"
+        elif [ "$rc" -eq 124 ]; then
+            emit_fail "$distro: bootstrap.sh exceeded 600s timeout"
+            tail -20 "$out" >&2 || true
+        else
+            emit_fail "$distro: python-install did not reach ✓ (rc=$rc)"
+            grep -E "^STEP:|^STATUS:" "$out" >&2 | head -10 || true
+        fi
+        docker rm -f "$name" >/dev/null 2>&1 || true
+    done
+}
+
+
 # ── Test 5: unsupported OS → STATUS: failure: unsupported_os ───────────
 
 test_unsupported_os() {
@@ -233,6 +307,7 @@ main() {
     test_help
     test_bad_flag
     test_dry_run
+    test_python_install
     test_unsupported_os
 
     echo ""
