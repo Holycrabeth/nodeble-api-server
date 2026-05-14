@@ -56,6 +56,14 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+# Suppress apt interactive prompts (tzdata, libc6 service restart, etc.)
+# globally. Without this, apt-get install on minimal cloud images / Docker
+# containers hangs waiting for tty input that never arrives via SSH exec.
+# Surfaced 5/14 by Test 6 deadsnakes-path stall on ubuntu:22.04 CI runner
+# — Phase F''' v1 (--dry-run only) didn't exercise apt install of
+# python3.12 deps so this latent bug was masked.
+export DEBIAN_FRONTEND=noninteractive
+
 # ── Config ─────────────────────────────────────────────────────────────
 
 REPO_URL="https://github.com/Holycrabeth/nodeble-api-server.git"

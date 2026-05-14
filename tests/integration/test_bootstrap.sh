@@ -233,22 +233,36 @@ test_python_install() {
         name=$(spin_container "$distro")
         # Pre-install tooling. software-properties-common is needed by
         # bootstrap.sh Attempt 3 (deadsnakes) — provides add-apt-repository.
-        docker exec "$name" apt-get update -y >/dev/null 2>&1 || true
-        docker exec "$name" apt-get install -y curl git openssl sudo software-properties-common \
+        # `-e DEBIAN_FRONTEND=noninteractive` prevents apt from prompting on
+        # tzdata / libc6 service restart / etc. (would otherwise hang the
+        # docker exec waiting for stdin input that never arrives via the
+        # CI runner's non-tty exec session — surfaced 5/14 CI cancellation).
+        docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+            apt-get update -y >/dev/null 2>&1 || true
+        docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+            apt-get install -y curl git openssl sudo software-properties-common \
             >/dev/null 2>&1 || true
         local out="$LOG_DIR/python-install-${distro//[:.]/_}.txt"
+        # `timeout 600` defensive cap — if a distro hangs unexpectedly,
+        # this iteration fails fast and the test reports it explicitly
+        # rather than running out the GHA 30-min job budget silently.
         # Set +e — we don't gate on overall exit (script will die at
         # enable-linger downstream; we just check the python-install
         # step marker.)
         set +e
-        docker exec "$name" bash /tmp/bootstrap.sh > "$out" 2>&1
+        timeout 600 docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+            bash /tmp/bootstrap.sh > "$out" 2>&1
+        local rc=$?
         set -e
         if grep -q "^STEP: python-install ✓" "$out"; then
             local detail
             detail=$(grep "^STEP: python-install ✓" "$out" | head -1 | sed 's|^STEP: python-install ✓ *||')
             emit_pass "$distro: python-install ✓ ($detail)"
+        elif [ "$rc" -eq 124 ]; then
+            emit_fail "$distro: bootstrap.sh exceeded 600s timeout"
+            tail -20 "$out" >&2 || true
         else
-            emit_fail "$distro: python-install did not reach ✓"
+            emit_fail "$distro: python-install did not reach ✓ (rc=$rc)"
             grep -E "^STEP:|^STATUS:" "$out" >&2 | head -10 || true
         fi
         docker rm -f "$name" >/dev/null 2>&1 || true
