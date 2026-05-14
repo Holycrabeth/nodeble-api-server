@@ -249,36 +249,98 @@ probe_sudo_and_tooling() {
 }
 
 
-# ── Step 2 — Python 3.12+ (spec §3.3) ──────────────────────────────────
+# ── Step 2 — Python 3.12+ (spec §3.3 + Yongtao 5/14 P0 T-20260514-150707) ──
+#
+# 3-attempt fallback chain so bootstrap.sh works on ANY Ubuntu release —
+# including dev releases like 25.10 questing where the deadsnakes PPA
+# returns 404. Yongtao 5/14 directive: "我们不应该随随便便就告诉别人 vps 是
+# 选什么版本的。既然有最新的为什么不用最新的。"
+#   Attempt 1 — apt-get install python3.12 from main repos (Ubuntu 24.04+
+#               ships python3.12 in main; fastest path).
+#   Attempt 2 — system python3 ≥ 3.12 symlinked as python3.12 (non-LTS
+#               releases like 25.10 questing ship newer Python natively
+#               but deadsnakes PPA doesn't cover them).
+#   Attempt 3 — deadsnakes PPA (Ubuntu 22.04 LTS backstop where system
+#               python3 is 3.10).
 
 install_python_if_needed() {
+    # Fast path: python3.12 binary already on system (user pre-installed,
+    # or re-run after prior bootstrap).
     if command -v python3.12 >/dev/null 2>&1; then
         local v
         v=$(python3.12 --version 2>&1 | awk '{print $2}')
         emit_step_ok "python-install" "Python $v already present"
         return 0
     fi
-    if [ "${ID:-}" = "ubuntu" ]; then
-        # deadsnakes PPA — gates python3.12 on Ubuntu 22 LTS where
-        # default repos still ship 3.10. Idempotent (add-apt-repository
-        # silently no-ops if already added).
-        # Need sudo. If we got here, probe_sudo_and_tooling has already
-        # verified sudo -n true succeeds.
-        local sudo_cmd=""
-        [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
-        quiet $sudo_cmd add-apt-repository -y ppa:deadsnakes/ppa \
-            || die "deadsnakes_ppa_failed"
-        quiet $sudo_cmd apt-get update -y \
-            || die "apt_update_failed"
-        quiet $sudo_cmd apt-get install -y python3.12 python3.12-venv python3.12-dev \
-            || die "python_install_failed"
-    elif [ "${ID:-}" = "debian" ]; then
+
+    if [ "${ID:-}" = "debian" ]; then
         # Debian 12 ships python3.11; 3.12 needs build-from-source or
         # the Debian 13 stable backport. For v1 we require 3.12 already
         # present on Debian — surface a clear error.
         die "debian_needs_python312_manual"
     fi
-    emit_step_ok "python-install" "Python 3.12 installed"
+    if [ "${ID:-}" != "ubuntu" ]; then
+        die "unsupported_os_for_python_install: ${ID:-unknown}"
+    fi
+
+    local sudo_cmd=""
+    [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+
+    quiet $sudo_cmd apt-get update -y 2>/dev/null || true
+
+    # Attempt 1: apt-get install from main repos.
+    if quiet $sudo_cmd apt-get install -y python3.12 python3.12-venv python3.12-dev 2>/dev/null; then
+        if command -v python3.12 >/dev/null 2>&1; then
+            local v
+            v=$(python3.12 --version 2>&1 | awk '{print $2}')
+            emit_step_ok "python-install" "Python $v installed from main repos"
+            return 0
+        fi
+    fi
+
+    # Attempt 2: system python3 ≥ 3.12 → symlink as python3.12.
+    if command -v python3 >/dev/null 2>&1; then
+        local sys_full sys_major sys_minor
+        sys_full=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "")
+        if [ -n "$sys_full" ]; then
+            sys_major="${sys_full%%.*}"
+            sys_minor="${sys_full##*.}"
+            if [ "$sys_major" = "3" ] && [ "$sys_minor" -ge 12 ] 2>/dev/null; then
+                # Install venv + dev modules for system python3 (separate
+                # packages on Ubuntu; needed for `python -m venv` and
+                # C-extension builds). `python3-venv` is a meta-package that
+                # tracks the system python3 major version.
+                quiet $sudo_cmd apt-get install -y python3-venv python3-dev \
+                    || die "python3_venv_install_failed"
+                # Symlink system python3 → /usr/local/bin/python3.12 so the
+                # rest of bootstrap.sh (venv creation etc.) which hardcodes
+                # python3.12 resolves to the system 3.12+ binary.
+                local py3_path
+                py3_path=$(command -v python3)
+                $sudo_cmd mkdir -p /usr/local/bin
+                $sudo_cmd ln -sf "$py3_path" /usr/local/bin/python3.12 \
+                    || die "python3_12_symlink_failed"
+                emit_step_ok "python-install" "Python $sys_full (system) symlinked as python3.12 (non-LTS fallback)"
+                return 0
+            fi
+        fi
+    fi
+
+    # Attempt 3: deadsnakes PPA (Ubuntu 22.04 LTS backstop).
+    # software-properties-common provides add-apt-repository on minimal
+    # container/cloud images that may not pre-install it.
+    quiet $sudo_cmd apt-get install -y software-properties-common \
+        || die "software_properties_install_failed"
+    quiet $sudo_cmd add-apt-repository -y ppa:deadsnakes/ppa \
+        || die "deadsnakes_ppa_failed"
+    quiet $sudo_cmd apt-get update -y \
+        || die "apt_update_failed"
+    quiet $sudo_cmd apt-get install -y python3.12 python3.12-venv python3.12-dev \
+        || die "python_install_failed"
+    if ! command -v python3.12 >/dev/null 2>&1; then
+        die "python_install_failed"
+    fi
+    emit_step_ok "python-install" "Python 3.12 installed via deadsnakes PPA"
 }
 
 
