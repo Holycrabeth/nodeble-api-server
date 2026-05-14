@@ -136,6 +136,143 @@ def test_current_usage_subprocess_oserror_500(client_with_fake_home, monkeypatch
     assert "failed to start" in r.json()["detail"]
 
 
+# ── REAL #17 gate (exit 2 → 503) ────────────────────────────────────────────
+# Per PnL Dev PR #2 `431d9b8` + 协作总监 T-20260514-142516: CLI exits 2 when
+# any strategy has LIVE positions but no `capital_used_<strategy>` formula
+# implemented yet. api-server maps the gate to 503 with strategies_affected
+# so downstream can branch on the specific class of service-unavailable.
+
+
+def test_current_usage_exit_2_returns_503_with_strategies_affected(
+    client_with_fake_home, monkeypatch,
+):
+    client, _ = client_with_fake_home
+    # PnL CLI emits diagnostic JSON even on the gated exit-2 path so
+    # api-server can surface strategies_affected without re-running.
+    gated_stdout = json.dumps({
+        "current_usage": {
+            "ic": 767.0, "wheel": 0.0, "pmcc": 0.0,
+            "cs": 0.0, "ironbutterfly": 0.0, "calendar": 0.0,
+            "straddle": 0.0, "strangle": 0.0, "collar": 0.0,
+        },
+        "as_of": "2026-05-14T14:25:16Z",
+        "formula_errors": [
+            {"strategy": "wheel", "message": "capital_used_wheel not implemented"},
+            {"strategy": "pmcc", "message": "capital_used_pmcc not implemented"},
+        ],
+    })
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 2, stdout=gated_stdout, stderr="")
+
+    monkeypatch.setattr(pnl_route.subprocess, "run", fake_run)
+
+    r = client.get("/api/v1/pnl/current_usage", headers=_hdr())
+    assert r.status_code == 503
+    body = r.json()
+    # Dispatch contract: body has `error` + `strategies_affected` keys,
+    # NOT wrapped in FastAPI's default `{"detail": ...}` shape.
+    assert body == {
+        "error": "formula_not_implemented",
+        "strategies_affected": ["wheel", "pmcc"],
+    }
+
+
+def test_current_usage_exit_2_malformed_stdout_503_empty_list(
+    client_with_fake_home, monkeypatch,
+):
+    """Defensive: gate fired but stdout JSON unparseable. Caller still
+    needs to know it's a formula-impl gap (not a generic crash) — return
+    503 with empty strategies_affected so caller branches on category +
+    server log carries the raw stderr."""
+    client, _ = client_with_fake_home
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 2, stdout="not valid json {{", stderr="boom")
+
+    monkeypatch.setattr(pnl_route.subprocess, "run", fake_run)
+
+    r = client.get("/api/v1/pnl/current_usage", headers=_hdr())
+    assert r.status_code == 503
+    assert r.json() == {
+        "error": "formula_not_implemented",
+        "strategies_affected": [],
+    }
+
+
+def test_current_usage_exit_2_no_formula_errors_key_503_empty_list(
+    client_with_fake_home, monkeypatch,
+):
+    """Defensive: gate fired (exit 2) but JSON lacks formula_errors key
+    (PnL CLI contract drift in a future version, or test fixture gap).
+    Still 503 + empty strategies_affected. Caller still gets the right
+    error class to branch on."""
+    client, _ = client_with_fake_home
+    minimal_stdout = json.dumps({"current_usage": {}, "as_of": "x"})
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 2, stdout=minimal_stdout, stderr="")
+
+    monkeypatch.setattr(pnl_route.subprocess, "run", fake_run)
+
+    r = client.get("/api/v1/pnl/current_usage", headers=_hdr())
+    assert r.status_code == 503
+    assert r.json() == {
+        "error": "formula_not_implemented",
+        "strategies_affected": [],
+    }
+
+
+def test_current_usage_exit_2_skips_missing_strategy_field(
+    client_with_fake_home, monkeypatch,
+):
+    """Defensive: formula_errors entry lacks `strategy` key (malformed CLI
+    output). Skip that entry in strategies_affected — preserve the valid
+    ones rather than blowing up the whole response. Mirror the spirit of
+    the malformed-JSON path: surface what we can, log the rest."""
+    client, _ = client_with_fake_home
+    stdout = json.dumps({
+        "current_usage": {},
+        "as_of": "x",
+        "formula_errors": [
+            {"strategy": "wheel", "message": "ok"},
+            {"message": "no strategy key"},           # silent skip
+            {"strategy": "pmcc", "message": "ok"},
+        ],
+    })
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 2, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(pnl_route.subprocess, "run", fake_run)
+
+    r = client.get("/api/v1/pnl/current_usage", headers=_hdr())
+    assert r.status_code == 503
+    assert r.json() == {
+        "error": "formula_not_implemented",
+        "strategies_affected": ["wheel", "pmcc"],
+    }
+
+
+def test_current_usage_exit_3_still_routes_to_500_generic(
+    client_with_fake_home, monkeypatch,
+):
+    """Verify only exit 2 is the special-cased gate. Other non-zero
+    exits still hit the generic 500 path (regression guard so a future
+    PnL Dev adding exit 3 = something-else doesn't silently get
+    misclassified as a formula gate)."""
+    client, _ = client_with_fake_home
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 3, stdout="", stderr="some other crash")
+
+    monkeypatch.setattr(pnl_route.subprocess, "run", fake_run)
+
+    r = client.get("/api/v1/pnl/current_usage", headers=_hdr())
+    assert r.status_code == 500
+    assert "exited 3" in r.json()["detail"]
+
+
 # ── Auth ────────────────────────────────────────────────────────────────────
 
 
