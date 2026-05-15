@@ -280,12 +280,21 @@ probe_sudo_and_tooling() {
 #               python3 is 3.10).
 
 install_python_if_needed() {
-    # Fast path: python3.12 binary already on system (user pre-installed,
-    # or re-run after prior bootstrap).
-    if command -v python3.12 >/dev/null 2>&1; then
+    # Fast path: python3.12 binary present AND venv-capable. Debian/Ubuntu
+    # unbundle `ensurepip` into the python3.12-venv package — the binary
+    # can exist (e.g. baked into a base image) while `python3.12 -m venv`
+    # still fails "ensurepip is not available". Verifying `import
+    # ensurepip` here prevents a false fast-path → venv_create_failed
+    # two steps later. If not venv-capable, fall through to apt install
+    # (Attempt 1 installs python3.12-venv + python3.12-dev). Surfaced
+    # 5/15 by test 7 on jrei/systemd-ubuntu:24.04 (python3.12 baked in,
+    # venv pkg absent) — Phase B "Bug 1" that nodeble-web already fixed
+    # but api-server's Phase F''' lineage regressed.
+    if command -v python3.12 >/dev/null 2>&1 \
+       && python3.12 -c 'import ensurepip' >/dev/null 2>&1; then
         local v
         v=$(python3.12 --version 2>&1 | awk '{print $2}')
-        emit_step_ok "python-install" "Python $v already present"
+        emit_step_ok "python-install" "Python $v already present (venv-capable)"
         return 0
     fi
 

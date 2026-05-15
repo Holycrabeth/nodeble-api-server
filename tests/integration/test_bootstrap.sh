@@ -324,8 +324,13 @@ test_firewall_open() {
     name=$(spin_systemd_container "$image")
     docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
         apt-get update -y >/dev/null 2>&1 || true
+    # iproute2 → `ss` (systemd-start port-bind check); ca-certificates →
+    # HTTPS for git clone / pip / public-IP probe. jrei/systemd-* base
+    # images are minimal and may ship neither. Mirrors nodeble-web's
+    # test_pat_redacted_in_error_output pre-install set.
     docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
-        apt-get install -y curl git openssl sudo >/dev/null 2>&1 || true
+        apt-get install -y curl git openssl sudo iproute2 ca-certificates \
+        >/dev/null 2>&1 || true
 
     local out1="$LOG_DIR/firewall-open-run1.txt"
     set +e
