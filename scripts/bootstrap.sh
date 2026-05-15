@@ -578,6 +578,79 @@ EOF
 }
 
 
+# ── Step 9.5 — Open firewall for API port (P0 T-20260515-210530) ───────
+#
+# Vultr + most cloud VMs ship `ufw` active allowing only 22/tcp. The
+# api-server binds 0.0.0.0:${API_PORT} and is locally healthy, but the
+# Mac app (a public client) cannot reach ${API_PORT} until the host
+# firewall allows it. 前端总监 verify-from-source 2026-05-15 confirmed
+# this is the root cause of the destroy-rebuild-same-problem loop —
+# SetupWizard writes connection.json, then RootRedirect's
+# probeEndpointAlive(https://IP:8765/health) times out → setDeadHost →
+# bounce back to /setup, despite fingerprint/token/SSH-fp all matching.
+#
+# Idempotent across ufw / firewalld / pure-iptables. die loud on real
+# failure: an install whose port stays blocked is the exact silent-
+# success bug we're fixing — emitting STATUS: success with an
+# unreachable server is worse than failing.
+
+open_firewall_port() {
+    local sudo_cmd=""
+    [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+    local port="$API_PORT"
+
+    # 1. ufw (Ubuntu/Vultr default). `ufw allow` is idempotent — re-adding
+    #    an existing rule prints "Skipping adding existing rule", exit 0.
+    #    `grep -qw active` distinguishes "Status: active" from "inactive"
+    #    (word-boundary: "active" in "inactive" is not a whole word).
+    if command -v ufw >/dev/null 2>&1 \
+       && $sudo_cmd ufw status 2>/dev/null | grep -qw active; then
+        $sudo_cmd ufw allow "${port}/tcp" >/dev/null 2>&1 \
+            || die "ufw_allow_failed"
+        $sudo_cmd ufw reload >/dev/null 2>&1 || true
+        emit_step_ok "firewall-open" "ufw allow ${port}/tcp"
+        return 0
+    fi
+
+    # 2. firewalld (RHEL-family; rare since os-check gates Ubuntu/Debian,
+    #    kept for defense + future OS support). --add-port is idempotent
+    #    (ALREADY_ENABLED warning still exits 0).
+    if command -v firewall-cmd >/dev/null 2>&1 \
+       && $sudo_cmd firewall-cmd --state >/dev/null 2>&1; then
+        $sudo_cmd firewall-cmd --add-port="${port}/tcp" --permanent >/dev/null 2>&1 \
+            || die "firewalld_add_port_failed"
+        $sudo_cmd firewall-cmd --reload >/dev/null 2>&1 || true
+        emit_step_ok "firewall-open" "firewalld add-port ${port}/tcp"
+        return 0
+    fi
+
+    # 3. Pure-iptables fallback: only act if INPUT policy is DROP/REJECT
+    #    (otherwise the port is already reachable; adding a rule is noise).
+    #    `-C` check-then-`-I` insert is idempotent.
+    if command -v iptables >/dev/null 2>&1; then
+        local input_policy
+        input_policy=$($sudo_cmd iptables -S INPUT 2>/dev/null | head -1)
+        if printf '%s' "$input_policy" | grep -qE -- '-P INPUT (DROP|REJECT)'; then
+            if ! $sudo_cmd iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+                $sudo_cmd iptables -I INPUT -p tcp --dport "$port" -j ACCEPT \
+                    || die "iptables_insert_failed"
+            fi
+            # Persist across reboot if the tooling is present (best-effort).
+            if command -v netfilter-persistent >/dev/null 2>&1; then
+                $sudo_cmd netfilter-persistent save >/dev/null 2>&1 || true
+            elif command -v iptables-save >/dev/null 2>&1 && [ -d /etc/iptables ]; then
+                $sudo_cmd sh -c 'iptables-save > /etc/iptables/rules.v4' 2>/dev/null || true
+            fi
+            emit_step_ok "firewall-open" "iptables ACCEPT tcp dpt ${port}"
+            return 0
+        fi
+    fi
+
+    # 4. No active blocking firewall detected — port already reachable.
+    emit_step_ok "firewall-open" "no active firewall (port ${port} already reachable)"
+}
+
+
 # ── Step 10 — RESULT lines + STATUS terminal (spec §2 + A4) ────────────
 
 emit_results_and_finish() {
@@ -653,6 +726,13 @@ main() {
     # Step 9 — systemd USER service install + start.
     emit_step "systemd-install"
     install_systemd_service
+
+    # Step 9.5 — open host firewall for the API port so the Mac app
+    # (public client) can actually reach the now-listening service
+    # (P0 T-20260515-210530). Placed AFTER systemd-start confirms the
+    # port is bound — don't open a hole to nothing.
+    emit_step "firewall-open"
+    open_firewall_port
 
     # Step 10 — emit RESULT + STATUS terminal (A4: STATUS must be the
     # last stdout line).
