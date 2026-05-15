@@ -94,7 +94,19 @@ spin_systemd_container() {
     docker run -d --name "$name" --privileged --cgroupns=host \
         -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
         "$image" >/dev/null
-    sleep 3
+    # Wait for systemd to finish booting — logind must be up before
+    # bootstrap.sh's `loginctl enable-linger`. `is-system-running`
+    # returns running|degraded once boot completes ("degraded" is fine
+    # in minimal containers — some unit failed but the system is up).
+    # Fixed 3s sleep was insufficient on GHA runners.
+    local i
+    for i in $(seq 1 40); do
+        if docker exec "$name" systemctl is-system-running 2>/dev/null \
+            | grep -qE 'running|degraded'; then
+            break
+        fi
+        sleep 1
+    done
     docker cp "$BOOTSTRAP_SH" "$name:/tmp/bootstrap.sh"
     docker exec "$name" chmod +x /tmp/bootstrap.sh
     echo "$name"

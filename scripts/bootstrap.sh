@@ -66,6 +66,14 @@ export DEBIAN_FRONTEND=noninteractive
 
 # ── Config ─────────────────────────────────────────────────────────────
 
+# $USER is unset under non-interactive `docker exec` / some SSH exec
+# configs (no login shell to populate it). `set -o nounset` would then
+# hard-exit (no die(), no STATUS line) the moment enable_linger
+# references it. Resolve once with an id(1) fallback. Mirrors
+# nodeble-web/bootstrap.sh USER_NAME pattern. Surfaced 5/15 by test 7
+# (first full-bootstrap-past-enable-linger coverage on api-server).
+USER_NAME="${USER:-$(id -un)}"
+
 REPO_URL="https://github.com/Holycrabeth/nodeble-api-server.git"
 REPO_DIR="$HOME/projects/nodeble-api-server"
 VENV_PYTHON="$REPO_DIR/.venv/bin/python"
@@ -355,14 +363,14 @@ install_python_if_needed() {
 # ── Step 3 — loginctl enable-linger (spec §3 + §12 risk #2) ────────────
 
 enable_linger() {
-    # loginctl enable-linger $USER is itself idempotent; running it
+    # loginctl enable-linger $USER_NAME is itself idempotent; running it
     # repeatedly is a no-op. But it requires sudo on most distros.
     local sudo_cmd=""
     [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
-    quiet $sudo_cmd loginctl enable-linger "$USER" \
+    quiet $sudo_cmd loginctl enable-linger "$USER_NAME" \
         || die "linger_enable_failed"
     # Verify (per spec §12 risk #2).
-    if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+    if ! loginctl show-user "$USER_NAME" 2>/dev/null | grep -q "Linger=yes"; then
         die "linger_verify_failed"
     fi
     emit_step_ok "enable-linger" "user services persist after logout"
@@ -669,6 +677,19 @@ emit_results_and_finish() {
 # ── Main orchestrator ─────────────────────────────────────────────────
 
 main() {
+    # `systemctl --user` (idempotency-probe Step 0 + systemd-install
+    # Step 9) needs XDG_RUNTIME_DIR. PAM (pam_systemd) sets it in
+    # interactive login sessions; non-interactive `docker exec` / some
+    # SSH exec configs do NOT. Set it proactively BEFORE the
+    # idempotency probe so a re-run correctly detects already_installed
+    # instead of bus-error → false "fresh install" → full re-install.
+    # On a truly fresh box /run/user/<uid> doesn't exist yet, so
+    # systemctl --user fails gracefully → probe returns 1 → fresh path
+    # (correct). On already-installed boxes the dir persists from prior
+    # linger. Mirrors nodeble-web/bootstrap.sh. Surfaced 5/15 by test 7
+    # (first full-bootstrap-past-enable-linger coverage on api-server).
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
     # Step 0 — idempotency probe.
     emit_step "idempotency-probe"
     if probe_existing_install; then
