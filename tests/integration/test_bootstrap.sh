@@ -99,8 +99,7 @@ spin_systemd_container() {
     # returns running|degraded once boot completes ("degraded" is fine
     # in minimal containers — some unit failed but the system is up).
     # Fixed 3s sleep was insufficient on GHA runners.
-    local i
-    for i in $(seq 1 40); do
+    for _ in $(seq 1 40); do
         if docker exec "$name" systemctl is-system-running 2>/dev/null \
             | grep -qE 'running|degraded'; then
             break
