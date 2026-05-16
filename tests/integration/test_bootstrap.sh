@@ -83,6 +83,35 @@ spin_container() {
 }
 
 
+# Spin a systemd-enabled container (jrei/systemd-* fixtures) so the full
+# bootstrap reaches enable-linger + systemd-install + firewall-open
+# (plain containers die at enable-linger). cgroup v2 flags per Tower /
+# GHA-runner host. Caller does `docker rm -f` cleanup.
+spin_systemd_container() {
+    local image="$1"
+    local name; name="bootstrap-test-systemd-$(echo "$image" | tr ':/' '--')"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker run -d --name "$name" --privileged --cgroupns=host \
+        -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+        "$image" >/dev/null
+    # Wait for systemd to finish booting — logind must be up before
+    # bootstrap.sh's `loginctl enable-linger`. `is-system-running`
+    # returns running|degraded once boot completes ("degraded" is fine
+    # in minimal containers — some unit failed but the system is up).
+    # Fixed 3s sleep was insufficient on GHA runners.
+    for _ in $(seq 1 40); do
+        if docker exec "$name" systemctl is-system-running 2>/dev/null \
+            | grep -qE 'running|degraded'; then
+            break
+        fi
+        sleep 1
+    done
+    docker cp "$BOOTSTRAP_SH" "$name:/tmp/bootstrap.sh"
+    docker exec "$name" chmod +x /tmp/bootstrap.sh
+    echo "$name"
+}
+
+
 # ── Test 1: syntax sanity (bash -n) across 3 supported distros ─────────
 
 test_syntax_clean() {
@@ -270,6 +299,83 @@ test_python_install() {
 }
 
 
+# ── Test 7: firewall-open step + idempotency (P0 T-20260515-210530) ────
+#
+# Full bootstrap on a systemd-enabled container (api-server clones from
+# the PUBLIC nodeble-api-server repo — no PAT needed). Verifies:
+#   1. `STEP: firewall-open ✓` is emitted (step wired into main())
+#   2. `STATUS: success` reached (step doesn't break the flow)
+#   3. Re-run → `STATUS: already_installed` (idempotency gate per
+#      acceptance criterion "重复 bootstrap 不报错")
+#
+# In a Docker container ufw is NOT active (no `ufw enable` run) so
+# open_firewall_port takes the "no active firewall" branch + no-ops
+# gracefully. The REAL ufw-active-VM path (ufw allow 8765/tcp) is
+# 前端总监's verifier gate: fresh Vultr VM → bootstrap → external
+# `curl -sk https://<IP>:8765/health` = 200 with NO manual firewall.
+# Docker can't faithfully simulate Vultr's ufw-active default; this
+# test covers integration + idempotency + regression, not the live
+# ufw-allow behavior (per dispatch: "否则文档标注需真 VM 验证").
+
+test_firewall_open() {
+    echo "=== Test 7: firewall-open step + idempotency (P0 T-20260515-210530) ==="
+    local image="jrei/systemd-ubuntu:24.04"
+    local name
+    name=$(spin_systemd_container "$image")
+    docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+        apt-get update -y >/dev/null 2>&1 || true
+    # iproute2 → `ss` (systemd-start port-bind check); ca-certificates →
+    # HTTPS for git clone / pip / public-IP probe. jrei/systemd-* base
+    # images are minimal and may ship neither. Mirrors nodeble-web's
+    # test_pat_redacted_in_error_output pre-install set.
+    docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+        apt-get install -y curl git openssl sudo iproute2 ca-certificates \
+        >/dev/null 2>&1 || true
+
+    local out1="$LOG_DIR/firewall-open-run1.txt"
+    set +e
+    timeout 600 docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+        bash /tmp/bootstrap.sh > "$out1" 2>&1
+    local rc1=$?
+    set -e
+
+    if grep -q "^STEP: firewall-open ✓" "$out1" \
+        && grep -q "^STATUS: success" "$out1"; then
+        local detail
+        detail=$(grep "^STEP: firewall-open ✓" "$out1" | head -1 | sed 's|^STEP: firewall-open ✓ *||')
+        emit_pass "firewall-open step reached + STATUS success ($detail)"
+    elif [ "$rc1" -eq 124 ]; then
+        emit_fail "firewall-open: bootstrap exceeded 600s timeout (run 1)"
+        grep -E "^STEP:|^STATUS:" "$out1" 2>/dev/null | tail -15 >&2 || true
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return
+    else
+        emit_fail "firewall-open: STEP/STATUS not as expected (run 1, rc=$rc1)"
+        grep -E "^STEP:|^STATUS:" "$out1" 2>/dev/null | tail -15 >&2 || true
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        return
+    fi
+
+    # Idempotency: re-run on the same (now-installed) container. The
+    # idempotency-probe should short-circuit to STATUS: already_installed
+    # WITHOUT erroring on the existing firewall rule.
+    local out2="$LOG_DIR/firewall-open-run2.txt"
+    set +e
+    timeout 300 docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+        bash /tmp/bootstrap.sh > "$out2" 2>&1
+    local rc2=$?
+    set -e
+    if grep -q "^STATUS: already_installed" "$out2" && [ "$rc2" -eq 0 ]; then
+        emit_pass "firewall-open idempotent re-run (STATUS: already_installed, exit 0)"
+    else
+        emit_fail "firewall-open: idempotent re-run not clean (rc=$rc2)"
+        grep -E "^STEP:|^STATUS:" "$out2" 2>/dev/null | tail -15 >&2 || true
+    fi
+
+    docker rm -f "$name" >/dev/null 2>&1 || true
+}
+
+
 # ── Test 5: unsupported OS → STATUS: failure: unsupported_os ───────────
 
 test_unsupported_os() {
@@ -308,6 +414,7 @@ main() {
     test_bad_flag
     test_dry_run
     test_python_install
+    test_firewall_open
     test_unsupported_os
 
     echo ""
