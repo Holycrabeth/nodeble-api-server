@@ -374,6 +374,27 @@ test_firewall_open() {
             docker rm -f "$name" >/dev/null 2>&1 || true
             return
         fi
+        # 🔒 T-20260516-112211 security regression: the scoped PAT must
+        # NOT persist at rest. Assert (1) no github_pat_/x-access-token
+        # anywhere under /root, (2) both repos' remote.origin.url is the
+        # clean tokenless https://github.com/... form.
+        if docker exec "$name" sh -c 'grep -rIl "github_pat_\|x-access-token" /root 2>/dev/null | head -1 | grep -q .'; then
+            emit_fail "SECURITY: token persisted at rest under /root after PAT bootstrap"
+            docker exec "$name" sh -c 'grep -rIl "github_pat_\|x-access-token" /root 2>/dev/null' >&2 || true
+            docker rm -f "$name" >/dev/null 2>&1 || true
+            return
+        fi
+        local orch_remote alloc_remote
+        orch_remote=$(docker exec "$name" git -C /root/projects/nodeble-orchestrator remote get-url origin 2>/dev/null || echo "?")
+        alloc_remote=$(docker exec "$name" git -C /root/projects/nodeble-allocator remote get-url origin 2>/dev/null || echo "?")
+        if [ "$orch_remote" = "https://github.com/Holycrabeth/nodeble-orchestrator.git" ] \
+            && [ "$alloc_remote" = "https://github.com/Holycrabeth/nodeble-allocator.git" ]; then
+            emit_pass "SECURITY: 0 token at rest under /root + both remote.origin.url tokenless clean"
+        else
+            emit_fail "SECURITY: remote.origin.url not clean (orch=$orch_remote alloc=$alloc_remote)"
+            docker rm -f "$name" >/dev/null 2>&1 || true
+            return
+        fi
         # Idempotency: re-run → already_installed (probe now also checks
         # orch+allocator venvs, so a fully-installed box short-circuits).
         local out2="$LOG_DIR/firewall-open-run2.txt"
