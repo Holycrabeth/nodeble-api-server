@@ -477,34 +477,76 @@ create_venv_and_install() {
 
 clone_chain_repo() {
     local repo_path="$1" target_dir="$2" name="$3"
+    local clean_url="https://github.com/${repo_path}.git"
+
+    # 🔒 T-20260516-112211 P0 SECURITY. A creds-in-URL clone
+    # (`git clone https://x-access-token:$PAT@github.com/...`) makes git
+    # PERSIST the full PAT into .git/config remote.origin.url forever
+    # (standard git behaviour) — sed only redacts clone *output*, not the
+    # at-rest config. Instead inject auth as a PER-COMMAND
+    # `-c http.<host>.extraheader` (git does NOT write `-c` overrides to
+    # .git/config) against the CLEAN tokenless URL → remote.origin.url
+    # stays `https://github.com/<repo>.git`, zero token at rest, zero
+    # persistence window (strictly better than clone-then-strip which has
+    # a crash window). Basic + base64(x-access-token:<pat>) is the
+    # GitHub-Actions-canonical proven format for git-over-HTTPS with
+    # fine-grained PATs (bearer is not reliably accepted by GitHub's
+    # git-smart-HTTP across versions — Basic eliminates auth-format risk).
+    # URL-scoped to github.com so the header can't leak on an off-host
+    # redirect (mirrors actions/checkout).
+    local b64="" hdr_args=()
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        b64=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
+        hdr_args=(-c "http.https://github.com/.extraheader=Authorization: Basic ${b64}")
+    fi
+
     if [ -d "$target_dir/.git" ]; then
-        # Idempotent re-run: fetch + hard reset to origin default branch.
+        # Self-heal: a pre-fix bootstrap (<= de2a75f) persisted the PAT
+        # into remote.origin.url on already-deployed boxes. Force it back
+        # to the clean tokenless URL so the leaked token is scrubbed on
+        # the next bootstrap of an existing box too.
+        git -C "$target_dir" remote set-url origin "$clean_url" 2>/dev/null || true
+        local def_branch
+        def_branch=$(git -C "$target_dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || echo main)
+        # Idempotent re-run: fetch with per-command auth header (token
+        # never persisted), hard reset to origin default branch.
         ( cd "$target_dir" \
-          && quiet git fetch origin \
-          && quiet git reset --hard "origin/$(git -C "$target_dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || echo main)" ) \
+          && quiet git "${hdr_args[@]}" fetch origin \
+          && quiet git reset --hard "origin/${def_branch:-main}" ) \
             || die "${name}_git_update_failed"
         return 0
     fi
+
     mkdir -p "$HOME/projects"
     if [ -n "${GITHUB_TOKEN:-}" ]; then
-        # PAT clone. sed-redact the token from any output (defensive vs
-        # accidental log leak — parser-clean stdout / stderr per VERBOSE).
-        local auth_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${repo_path}.git"
+        # PAT clone via per-command header against the CLEAN url — the
+        # token never enters .git/config.
+        # Defense-in-depth redaction of raw token + its base64 form (the
+        # header path shouldn't echo either, but a verbose git trace
+        # could). Both are guaranteed set in this PAT branch.
         if [ "$VERBOSE" -eq 1 ]; then
-            git clone "$auth_url" "$target_dir" 2>&1 | sed "s|${GITHUB_TOKEN}|<REDACTED>|g"
+            git "${hdr_args[@]}" clone "$clean_url" "$target_dir" 2>&1 \
+                | sed -e "s|${GITHUB_TOKEN}|<REDACTED>|g" -e "s|${b64}|<REDACTED>|g"
         else
-            git clone "$auth_url" "$target_dir" 2>&1 | sed "s|${GITHUB_TOKEN}|<REDACTED>|g" >&2
+            git "${hdr_args[@]}" clone "$clean_url" "$target_dir" 2>&1 \
+                | sed -e "s|${GITHUB_TOKEN}|<REDACTED>|g" -e "s|${b64}|<REDACTED>|g" >&2
         fi
         local rc="${PIPESTATUS[0]}"
         if [ "$rc" -ne 0 ]; then
             die "${name}_git_clone_failed: PAT clone exit $rc (verify GITHUB_TOKEN repo:read on ${repo_path})"
         fi
-        # Drop any cached credential helper that may have stored the PAT.
+        # Belt-and-suspenders: the clean-url clone should leave no token,
+        # but assert + scrub if any prior config/helper smuggled one in.
+        if git -C "$target_dir" config --get remote.origin.url 2>/dev/null \
+            | grep -q 'x-access-token\|github_pat_\|@github.com'; then
+            git -C "$target_dir" remote set-url origin "$clean_url" \
+                || die "${name}_token_scrub_failed"
+        fi
         git -C "$target_dir" config --unset-all credential.helper 2>/dev/null || true
         return 0
     fi
     # No PAT — anonymous attempt (succeeds only if repo is public).
-    if ! ( cd "$HOME/projects" && quiet git clone "https://github.com/${repo_path}.git" ); then
+    if ! ( cd "$HOME/projects" && quiet git clone "$clean_url" ); then
         die "${name}_git_clone_failed: ${repo_path} is private + no GITHUB_TOKEN. Mac app must deliver GITHUB_TOKEN via SSH env, OR ${repo_path} must be toggled public (mirrors 5/12 api-server precedent — 协作总监/前端总监 decision)"
     fi
 }
