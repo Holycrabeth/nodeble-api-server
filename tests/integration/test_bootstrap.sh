@@ -299,7 +299,7 @@ test_python_install() {
 }
 
 
-# ── Test 7: firewall-open step + idempotency (P0 T-20260515-210530) ────
+# ── Test 7: firewall-open + chain-install wiring (P0 T-20260515-210530 + T-20260515-214527) ──
 #
 # Full bootstrap on a systemd-enabled container (api-server clones from
 # the PUBLIC nodeble-api-server repo — no PAT needed). Verifies:
@@ -332,44 +332,73 @@ test_firewall_open() {
         apt-get install -y curl git openssl sudo iproute2 ca-certificates \
         >/dev/null 2>&1 || true
 
+    # T-20260515-214527 added chain-install (orch+allocator) AFTER
+    # firewall-open. Both repos are PRIVATE. CI has no GITHUB_TOKEN
+    # secret → chain clone fails by design. Two verification modes:
+    #   • PAT present (local: export NODEBLE_TEST_PAT=...) → full
+    #     STATUS: success + orch/alloc .venv/bin/python exist + idempotent
+    #   • PAT absent (default CI) → firewall-open ✓ MUST still be reached,
+    #     then bootstrap dies cleanly at orch-install with
+    #     `orchestrator_git_clone_failed` (proves: firewall step works +
+    #     chain-install wired + fails for the DOCUMENTED reason, not a
+    #     silent skip). Real success-path e2e = 前端总监 Vultr gate
+    #     (Mac app delivers GITHUB_TOKEN via SSH env).
+    local pat="${NODEBLE_TEST_PAT:-${GITHUB_TOKEN:-}}"
+    local denv=(-e DEBIAN_FRONTEND=noninteractive)
+    [ -n "$pat" ] && denv+=(-e "GITHUB_TOKEN=$pat")
     local out1="$LOG_DIR/firewall-open-run1.txt"
     set +e
-    timeout 600 docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
+    timeout 600 docker exec "${denv[@]}" "$name" \
         bash /tmp/bootstrap.sh > "$out1" 2>&1
     local rc1=$?
     set -e
 
-    if grep -q "^STEP: firewall-open ✓" "$out1" \
-        && grep -q "^STATUS: success" "$out1"; then
-        local detail
-        detail=$(grep "^STEP: firewall-open ✓" "$out1" | head -1 | sed 's|^STEP: firewall-open ✓ *||')
-        emit_pass "firewall-open step reached + STATUS success ($detail)"
-    elif [ "$rc1" -eq 124 ]; then
-        emit_fail "firewall-open: bootstrap exceeded 600s timeout (run 1)"
-        grep -E "^STEP:|^STATUS:" "$out1" 2>/dev/null | tail -15 >&2 || true
-        docker rm -f "$name" >/dev/null 2>&1 || true
-        return
-    else
-        emit_fail "firewall-open: STEP/STATUS not as expected (run 1, rc=$rc1)"
+    if ! grep -q "^STEP: firewall-open ✓" "$out1"; then
+        emit_fail "firewall-open: step not reached (run 1, rc=$rc1)"
         grep -E "^STEP:|^STATUS:" "$out1" 2>/dev/null | tail -15 >&2 || true
         docker rm -f "$name" >/dev/null 2>&1 || true
         return
     fi
+    local fw_detail
+    fw_detail=$(grep "^STEP: firewall-open ✓" "$out1" | head -1 | sed 's|^STEP: firewall-open ✓ *||')
 
-    # Idempotency: re-run on the same (now-installed) container. The
-    # idempotency-probe should short-circuit to STATUS: already_installed
-    # WITHOUT erroring on the existing firewall rule.
-    local out2="$LOG_DIR/firewall-open-run2.txt"
-    set +e
-    timeout 300 docker exec -e DEBIAN_FRONTEND=noninteractive "$name" \
-        bash /tmp/bootstrap.sh > "$out2" 2>&1
-    local rc2=$?
-    set -e
-    if grep -q "^STATUS: already_installed" "$out2" && [ "$rc2" -eq 0 ]; then
-        emit_pass "firewall-open idempotent re-run (STATUS: already_installed, exit 0)"
+    if [ -n "$pat" ]; then
+        # Full chain path (PAT available).
+        if grep -q "^STATUS: success" "$out1" \
+            && docker exec "$name" test -x /root/projects/nodeble-orchestrator/.venv/bin/python \
+            && docker exec "$name" test -x /root/projects/nodeble-allocator/.venv/bin/python; then
+            emit_pass "firewall-open ✓ ($fw_detail) + chain-install: orch+allocator .venv/bin/python exist + STATUS success"
+        else
+            emit_fail "firewall-open: PAT set but full chain did not complete (rc=$rc1)"
+            grep -E "^STEP:|^STATUS:" "$out1" 2>/dev/null | tail -20 >&2 || true
+            docker rm -f "$name" >/dev/null 2>&1 || true
+            return
+        fi
+        # Idempotency: re-run → already_installed (probe now also checks
+        # orch+allocator venvs, so a fully-installed box short-circuits).
+        local out2="$LOG_DIR/firewall-open-run2.txt"
+        set +e
+        timeout 300 docker exec "${denv[@]}" "$name" \
+            bash /tmp/bootstrap.sh > "$out2" 2>&1
+        local rc2=$?
+        set -e
+        if grep -q "^STATUS: already_installed" "$out2" && [ "$rc2" -eq 0 ]; then
+            emit_pass "chain idempotent re-run (STATUS: already_installed, exit 0)"
+        else
+            emit_fail "chain: idempotent re-run not clean (rc=$rc2)"
+            grep -E "^STEP:|^STATUS:" "$out2" 2>/dev/null | tail -15 >&2 || true
+        fi
     else
-        emit_fail "firewall-open: idempotent re-run not clean (rc=$rc2)"
-        grep -E "^STEP:|^STATUS:" "$out2" 2>/dev/null | tail -15 >&2 || true
+        # No-PAT path (default CI): firewall-open ✓ reached, then
+        # chain-install fails cleanly at orch-install for the documented
+        # private-repo reason. This PASSES the wiring assertion.
+        if grep -q "^STEP: orch-install ✗" "$out1" \
+            && grep -qE "^STATUS: failure: orchestrator_git_clone_failed" "$out1"; then
+            emit_pass "firewall-open ✓ ($fw_detail); chain-install wired, dies clean at orch-install (private repo, no PAT — full e2e = 前端总监 Vultr gate)"
+        else
+            emit_fail "no-PAT path: expected firewall-open ✓ then orch-install ✗ orchestrator_git_clone_failed (rc=$rc1)"
+            grep -E "^STEP:|^STATUS:" "$out1" 2>/dev/null | tail -20 >&2 || true
+        fi
     fi
 
     docker rm -f "$name" >/dev/null 2>&1 || true

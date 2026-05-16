@@ -77,6 +77,19 @@ USER_NAME="${USER:-$(id -un)}"
 REPO_URL="https://github.com/Holycrabeth/nodeble-api-server.git"
 REPO_DIR="$HOME/projects/nodeble-api-server"
 VENV_PYTHON="$REPO_DIR/.venv/bin/python"
+
+# Model A chain modules (T-20260515-214527). The api-server invokes
+# `$HOME/projects/nodeble-orchestrator/.venv/bin/python -m
+# nodeble_orchestrator allocate` (verified: nodeble_api_server/routes/
+# orchestrator.py:70-72) — so orchestrator+allocator MUST be installed
+# at $HOME/projects/ (NOT /opt/nodeble/ which nodeble-web Model B uses).
+# repo_path form (owner/name) for PAT-aware clone — both repos PRIVATE.
+ORCH_REPO_PATH="Holycrabeth/nodeble-orchestrator"
+ORCH_DIR="$HOME/projects/nodeble-orchestrator"
+ORCH_VENV_PYTHON="$ORCH_DIR/.venv/bin/python"
+ALLOC_REPO_PATH="Holycrabeth/nodeble-allocator"
+ALLOC_DIR="$HOME/projects/nodeble-allocator"
+ALLOC_VENV_PYTHON="$ALLOC_DIR/.venv/bin/python"
 CONFIG_DIR="$HOME/.nodeble-api/config"
 CONFIG_YAML="$CONFIG_DIR/api.yaml"
 TLS_DIR="$HOME/.nodeble-api/tls"
@@ -169,6 +182,13 @@ probe_existing_install() {
     [ -x "$VENV_PYTHON" ] || return 1
     [ -r "$CONFIG_YAML" ] || return 1
     systemctl --user is-active nodeble-api-server.service >/dev/null 2>&1 || return 1
+    # Chain modules must ALSO be present (T-20260515-214527). Without
+    # this, a re-bootstrap on an api-server-only box (exactly Yongtao's
+    # 45.77.249.52 state — api-server installed, orch/allocator missing)
+    # would short-circuit `already_installed` and NEVER install the
+    # missing orchestrator/allocator → "分配检查" stays Errno-2 forever.
+    [ -x "$ORCH_VENV_PYTHON" ] || return 1
+    [ -x "$ALLOC_VENV_PYTHON" ] || return 1
     return 0
 }
 
@@ -425,6 +445,86 @@ create_venv_and_install() {
     ( cd "$REPO_DIR" && quiet "$VENV_PYTHON" -m pip install -e . ) \
         || die "pip_install_failed"
     emit_step_ok "pip-install" "dependencies installed"
+}
+
+
+# ── Step 9.6/9.7 — Chain-install orchestrator + allocator ──────────────
+#   T-20260515-214527 (P0 MVP-blocking — Mac app "分配检查" Errno-2).
+#
+# Model A: api-server invokes
+#   $HOME/projects/nodeble-orchestrator/.venv/bin/python -m
+#   nodeble_orchestrator allocate
+# (verified nodeble_api_server/routes/orchestrator.py:70-72). bootstrap.sh
+# only installed api-server → orch/allocator absent → Errno-2 on first
+# "分配检查". This step closes MVP_FLOW §1 Step 6 / §3 row 5.
+#
+# Scope: clone + venv + `pip install -e .` ONLY. We deliberately do NOT
+# run the modules' deploy.sh: verify-from-source 5/15 — orch deploy.sh
+# `--non-interactive` HARD-EXITS without --nlv/--floor/--reserve;
+# allocator deploy.sh `--non-interactive` requires --config. Neither is
+# available at bootstrap time — the Mac app collects "总投入资金 USD"
+# at MVP Step 6.5 AFTER install + pushes via api-server, which then
+# drives the capital-configured allocate. This step's contract is
+# narrowly: make `.venv/bin/python` exist + the module importable so
+# the allocate subprocess STARTS (no Errno-2). cron/scheduled-allocate
+# = Step 6.5 follow-up, separate ledger.
+#
+# Both repos are PRIVATE (api-server is public — anon clone works there;
+# orch/allocator do NOT). PAT-aware clone mirrors nodeble-web's
+# clone_private_repo: GITHUB_TOKEN → x-access-token URL (Mac app delivers
+# via SSH env), else anon attempt (works only if a repo is later toggled
+# public). die loud with actionable reason if neither path works.
+
+clone_chain_repo() {
+    local repo_path="$1" target_dir="$2" name="$3"
+    if [ -d "$target_dir/.git" ]; then
+        # Idempotent re-run: fetch + hard reset to origin default branch.
+        ( cd "$target_dir" \
+          && quiet git fetch origin \
+          && quiet git reset --hard "origin/$(git -C "$target_dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || echo main)" ) \
+            || die "${name}_git_update_failed"
+        return 0
+    fi
+    mkdir -p "$HOME/projects"
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        # PAT clone. sed-redact the token from any output (defensive vs
+        # accidental log leak — parser-clean stdout / stderr per VERBOSE).
+        local auth_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${repo_path}.git"
+        if [ "$VERBOSE" -eq 1 ]; then
+            git clone "$auth_url" "$target_dir" 2>&1 | sed "s|${GITHUB_TOKEN}|<REDACTED>|g"
+        else
+            git clone "$auth_url" "$target_dir" 2>&1 | sed "s|${GITHUB_TOKEN}|<REDACTED>|g" >&2
+        fi
+        local rc="${PIPESTATUS[0]}"
+        if [ "$rc" -ne 0 ]; then
+            die "${name}_git_clone_failed: PAT clone exit $rc (verify GITHUB_TOKEN repo:read on ${repo_path})"
+        fi
+        # Drop any cached credential helper that may have stored the PAT.
+        git -C "$target_dir" config --unset-all credential.helper 2>/dev/null || true
+        return 0
+    fi
+    # No PAT — anonymous attempt (succeeds only if repo is public).
+    if ! ( cd "$HOME/projects" && quiet git clone "https://github.com/${repo_path}.git" ); then
+        die "${name}_git_clone_failed: ${repo_path} is private + no GITHUB_TOKEN. Mac app must deliver GITHUB_TOKEN via SSH env, OR ${repo_path} must be toggled public (mirrors 5/12 api-server precedent — 协作总监/前端总监 decision)"
+    fi
+}
+
+# clone + venv + pip install -e .  (no deploy.sh — see rationale above).
+install_chain_module() {
+    local step="$1" name="$2" repo_path="$3" target_dir="$4" venv_py="$5"
+    clone_chain_repo "$repo_path" "$target_dir" "$name"
+    if [ ! -x "$venv_py" ]; then
+        ( cd "$target_dir" && quiet python3.12 -m venv .venv ) \
+            || die "${name}_venv_create_failed"
+    fi
+    # pip install -e . is idempotent.
+    ( cd "$target_dir" && quiet "$venv_py" -m pip install --upgrade pip ) \
+        || die "${name}_pip_upgrade_failed"
+    ( cd "$target_dir" && quiet "$venv_py" -m pip install -e . ) \
+        || die "${name}_pip_install_failed"
+    local head
+    head=$( cd "$target_dir" && git log -1 --format='%h' 2>/dev/null || echo '?' )
+    emit_step_ok "$step" "$name at $target_dir ($head, .venv/bin/python ready)"
 }
 
 
@@ -763,6 +863,19 @@ main() {
     # port is bound — don't open a hole to nothing.
     emit_step "firewall-open"
     open_firewall_port
+
+    # Step 9.6/9.7 — chain-install orchestrator + allocator at
+    # $HOME/projects/ so api-server's `python -m nodeble_orchestrator
+    # allocate` subprocess can start (P0 T-20260515-214527 — MVP §1
+    # Step 6 / §3 row 5). Without this the Mac app "分配检查" → Errno-2
+    # (No such file: .../nodeble-orchestrator/.venv/bin/python).
+    emit_step "orch-install"
+    install_chain_module orch-install orchestrator \
+        "$ORCH_REPO_PATH" "$ORCH_DIR" "$ORCH_VENV_PYTHON"
+
+    emit_step "allocator-install"
+    install_chain_module allocator-install allocator \
+        "$ALLOC_REPO_PATH" "$ALLOC_DIR" "$ALLOC_VENV_PYTHON"
 
     # Step 10 — emit RESULT + STATUS terminal (A4: STATUS must be the
     # last stdout line).
