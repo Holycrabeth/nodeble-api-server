@@ -82,6 +82,94 @@ def _overrides_yaml_path(home: Path | None = None) -> Path:
     return base / ".nodeble-orchestrator" / "config" / "overrides.yaml"
 
 
+def _total_pool_path(home: Path | None = None) -> Path:
+    # Orchestrator's own config dir — api-server already writes
+    # overrides.yaml here (established pattern). Orchestrator's
+    # `capital_pool.load_total_pool` reads exactly this path/schema
+    # (contract ~/projects/cto/reviews/2026-05-16-total-pool-api-contract.md §2).
+    base = home or Path.home()
+    return base / ".nodeble-orchestrator" / "config" / "total_pool.json"
+
+
+# ── total-pool validity bounds (T-20260516-105451 #3) ──────────────────────
+#
+# SINGLE SOURCE OF TRUTH = nodeble_orchestrator/capital_pool.py
+# (MIN_REASONABLE_POOL_USD / MAX_REASONABLE_POOL_USD). Per contract §4:
+# api-server may run in a SEPARATE venv from nodeble_orchestrator on
+# some deploys (single-bot / fresh VM) so we cannot hard-import it.
+# These constants are REPLICATED with this comment + guarded by
+# `test_total_pool_bounds_match_orchestrator_contract` (contract-drift
+# test) so a value the app accepts can never be silently rejected by
+# the cron later. If you change these, change the orchestrator reader
+# + the contract doc §4 in the same PR.
+MIN_REASONABLE_POOL_USD = 1_000.0
+MAX_REASONABLE_POOL_USD = 1_000_000_000.0  # $1B
+
+
+def _is_valid_pool_usd(v: object) -> bool:
+    """True iff `v` is a real number (NOT bool) within [MIN, MAX].
+    Mirrors the orchestrator reader's reject set (contract §4)."""
+    if isinstance(v, bool):  # bool is an int subclass — reject explicitly
+        return False
+    if not isinstance(v, (int, float)):
+        return False
+    if v <= 0:
+        return False
+    return MIN_REASONABLE_POOL_USD <= float(v) <= MAX_REASONABLE_POOL_USD
+
+
+def _read_total_pool(home: Path | None = None) -> dict | None:
+    """Parse total_pool.json. Returns the dict iff present + the
+    `total_pool_usd` is valid per §4 bounds; else None (absent /
+    corrupt / out-of-bounds all collapse to "not declared" — the gate
+    + the orchestrator reader must agree on validity)."""
+    p = _total_pool_path(home)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict) or not _is_valid_pool_usd(
+        data.get("total_pool_usd")
+    ):
+        return None
+    return data
+
+
+def _write_total_pool_json(
+    total_pool_usd: float,
+    source: str,
+    home: Path | None = None,
+) -> str:
+    """Atomic write (tmp + os.replace, mode 0600 — config-dir hygiene
+    matching overrides.yaml). Returns the ISO-8601 `updated_at` written.
+    Contract §3.2 step 2."""
+    p = _total_pool_path(home)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    updated_at = datetime.now(timezone.utc).astimezone().isoformat()
+    payload = {
+        "total_pool_usd": total_pool_usd,
+        "updated_at": updated_at,
+        "source": source,
+    }
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(p.parent), prefix=".total_pool_", suffix=".json.tmp",
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, p)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return updated_at
+
+
 # ── Pydantic request models ────────────────────────────────────────────────
 
 
@@ -148,6 +236,34 @@ class AllocateIn(BaseModel):
     # Bypass idempotency lock — frontend asks user "cron just ran <Xs ago,
     # force?" and re-POSTs with force=True on confirm.
     force: bool = False
+
+
+class TotalPoolIn(BaseModel):
+    """POST /total-pool body (contract §3.2). `extra='forbid'` — typo'd
+    fields 422 not silent no-op (same rationale as AllocateIn).
+
+    Bounds validation is intentionally NOT a pydantic `Field(ge=…)` —
+    the contract wants a plain-language 422 message the app surfaces
+    verbatim (Yongtao Layman), so the handler validates + raises with
+    custom copy rather than pydantic's generic "ensure this value is
+    greater than or equal to …".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # `Any` (NOT `float`) on purpose: pydantic's lax mode coerces JSON
+    # `true`→1.0 / `"250000"`→250000.0 BEFORE the handler, which would
+    # (a) let a bool slip past the contract §4 "reject bool" rule and
+    # (b) replace our plain-language 422 with pydantic's generic error
+    # list — but contract §3.2 requires `detail` be the verbatim
+    # plain-language string the app surfaces. So we accept the raw
+    # value untouched and validate entirely in-handler via
+    # `_is_valid_pool_usd` (which sees the true runtime type).
+    total_pool_usd: Any
+    # "user_declared" (MVP Step 6.5 first set) vs "settings_edit"
+    # (later Settings edit). Optional — handler infers from
+    # file-already-existed when absent (contract §3.2 step 2).
+    source: str | None = None
 
 
 # ── Lock helpers (read-side only — orchestrator owns the writer) ──────────
@@ -508,3 +624,101 @@ def put_overrides(payload: OverridesIn) -> dict:
     sum_check = _compute_sum_check(overrides_dict)
 
     return {"applied": True, "sum_check_result": sum_check}
+
+
+# ── total-pool (T-20260516-105451 #3 — capital-input-upfront) ──────────────
+# Contract: ~/projects/cto/reviews/2026-05-16-total-pool-api-contract.md
+# Orchestrator owns the schema (capital_pool.load_total_pool); api-server
+# writes the file + triggers re-allocate. NOT a CTO spec (data-handoff
+# between two server-side components, like overrides.yaml).
+
+
+@router.get("/total-pool")
+def get_total_pool() -> dict:
+    """Reliability-gate query (contract §3.1). The app BLOCKS main UI
+    while ``declared == false``. 200 ALWAYS — ``declared:false`` is a
+    normal state (fresh box never told its pool / corrupt / out of
+    bounds), not an error. Validity uses the SAME bounds as the
+    orchestrator reader (§4) so the gate + cron agree."""
+    data = _read_total_pool()
+    if data is None:
+        return {"declared": False, "total_pool_usd": None, "updated_at": None}
+    return {
+        "declared": True,
+        "total_pool_usd": data["total_pool_usd"],
+        "updated_at": data.get("updated_at"),
+    }
+
+
+@router.post("/total-pool")
+def post_total_pool(payload: TotalPoolIn) -> dict:
+    """Set the declared total pool (contract §3.2).
+
+    1. Validate bounds → 422 w/ plain-language message (app surfaces
+       verbatim — Yongtao Layman).
+    2. Atomic write total_pool.json (0600).
+    3. Trigger re-allocate via the EXISTING allocate codepath
+       (``_run_allocate_subprocess``) so the new pool takes effect now
+       instead of waiting for the 09:58 ET cron. Reuses the existing
+       allocate lock (the orchestrator CLI's ``--idempotency-window``)
+       — NO second lock mechanism. Subprocess error / timeout / non-zero
+       (e.g. scores not yet present on a brand-fresh box) → still 200
+       for the SET, ``reallocate:"deferred"`` (next cron picks it up);
+       UI is never blocked on the re-allocate.
+    """
+    v = payload.total_pool_usd
+    if not _is_valid_pool_usd(v):
+        # Plain-language, app-surfaced verbatim. Distinguish the two
+        # common operator mistakes (too small = entered cents/units;
+        # too large = typo) per Yongtao Layman.
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            msg = "请输入一个有效的美元金额 (大于 0 的数字)"
+        elif float(v) < MIN_REASONABLE_POOL_USD:
+            msg = (
+                f"金额太小 (最低 ${int(MIN_REASONABLE_POOL_USD):,}) — "
+                "请确认你输入的是美元不是分"
+            )
+        else:
+            msg = (
+                f"金额太大 (上限 ${int(MAX_REASONABLE_POOL_USD):,}) — "
+                "请确认没有多打几个 0"
+            )
+        raise HTTPException(status_code=422, detail=msg)
+
+    # source: explicit flag wins; else infer (file existed → a later
+    # Settings edit; absent → first MVP Step 6.5 declaration).
+    if payload.source in ("user_declared", "settings_edit"):
+        source = payload.source
+    else:
+        source = (
+            "settings_edit"
+            if _total_pool_path().exists()
+            else "user_declared"
+        )
+
+    updated_at = _write_total_pool_json(float(v), source)
+
+    # Re-allocate (best-effort — never block the set on it). Reuse the
+    # existing subprocess + lock; respect_overrides mirrors the cron /
+    # AllocationCheckButton default.
+    reallocate = "deferred"
+    try:
+        rc, _stdout, _stderr = _run_allocate_subprocess(
+            AllocateIn(respect_overrides=True)
+        )
+        if rc == 0:
+            reallocate = "ok"
+            # Same cache-staleness fix as POST /allocate — clear so a
+            # subsequent GET /allocation sees the fresh pool-based run.
+            state_reader.clear_cache()
+    except (subprocess.SubprocessError, OSError, subprocess.TimeoutExpired):
+        # Brand-fresh box (scores absent) etc. — set succeeded, defer
+        # the allocate to the next cron tick. NOT a 5xx.
+        reallocate = "deferred"
+
+    return {
+        "status": "ok",
+        "total_pool_usd": float(v),
+        "updated_at": updated_at,
+        "reallocate": reallocate,
+    }

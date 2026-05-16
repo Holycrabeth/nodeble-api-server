@@ -608,3 +608,204 @@ def test_overrides_get_still_200_regression(client_with_fake_home):
     r = client.get("/api/v1/orchestrator/overrides", headers=_hdr())
     assert r.status_code == 200
     assert r.json()["overrides"]["ic"]["fixed_cap_usd"] == 50000
+
+
+# ── total-pool (T-20260516-105451 #3 capital-input-upfront) ────────────────
+# Contract: ~/projects/cto/reviews/2026-05-16-total-pool-api-contract.md
+
+
+def _total_pool_file(tmp_path: Path) -> Path:
+    return tmp_path / ".nodeble-orchestrator" / "config" / "total_pool.json"
+
+
+def test_total_pool_get_not_declared_when_absent(client_with_fake_home):
+    client, _ = client_with_fake_home
+    r = client.get("/api/v1/orchestrator/total-pool", headers=_hdr())
+    assert r.status_code == 200  # declared:false is normal, not an error
+    assert r.json() == {
+        "declared": False,
+        "total_pool_usd": None,
+        "updated_at": None,
+    }
+
+
+def test_total_pool_get_declared_after_valid_write(client_with_fake_home):
+    client, tmp_path = client_with_fake_home
+    f = _total_pool_file(tmp_path)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({
+        "total_pool_usd": 250000,
+        "updated_at": "2026-05-16T10:54:51-04:00",
+        "source": "user_declared",
+    }))
+    r = client.get("/api/v1/orchestrator/total-pool", headers=_hdr())
+    assert r.status_code == 200
+    assert r.json() == {
+        "declared": True,
+        "total_pool_usd": 250000,
+        "updated_at": "2026-05-16T10:54:51-04:00",
+    }
+
+
+def test_total_pool_get_not_declared_when_out_of_bounds(client_with_fake_home):
+    # Gate + cron must agree on validity (§4): an out-of-bounds value
+    # on disk reads as declared:false (same as orchestrator reader).
+    client, tmp_path = client_with_fake_home
+    f = _total_pool_file(tmp_path)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"total_pool_usd": 500, "updated_at": "x"}))  # <$1k
+    r = client.get("/api/v1/orchestrator/total-pool", headers=_hdr())
+    assert r.json()["declared"] is False
+
+
+def test_total_pool_get_not_declared_when_corrupt(client_with_fake_home):
+    client, tmp_path = client_with_fake_home
+    f = _total_pool_file(tmp_path)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("{not json")
+    r = client.get("/api/v1/orchestrator/total-pool", headers=_hdr())
+    assert r.status_code == 200
+    assert r.json()["declared"] is False
+
+
+def test_total_pool_post_valid_writes_atomically_and_reallocates(
+    client_with_fake_home, monkeypatch,
+):
+    client, tmp_path = client_with_fake_home
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orch_route.subprocess, "run", fake_run)
+
+    r = client.post(
+        "/api/v1/orchestrator/total-pool",
+        headers=_hdr(),
+        json={"total_pool_usd": 250000},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["total_pool_usd"] == 250000.0
+    assert body["reallocate"] == "ok"
+    assert body["updated_at"]  # ISO-8601 server now
+
+    # File written with the contract schema (orchestrator parses this).
+    on_disk = json.loads(_total_pool_file(tmp_path).read_text())
+    assert on_disk["total_pool_usd"] == 250000.0
+    assert on_disk["source"] == "user_declared"  # first set, no prior file
+    assert on_disk["updated_at"] == body["updated_at"]
+    # 0600 hygiene (matches overrides.yaml dir).
+    assert oct(_total_pool_file(tmp_path).stat().st_mode)[-3:] == "600"
+
+
+def test_total_pool_post_second_set_infers_settings_edit(
+    client_with_fake_home, monkeypatch,
+):
+    client, tmp_path = client_with_fake_home
+    monkeypatch.setattr(
+        orch_route.subprocess, "run",
+        lambda a, **k: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
+    )
+    client.post("/api/v1/orchestrator/total-pool", headers=_hdr(),
+                json={"total_pool_usd": 100000})
+    client.post("/api/v1/orchestrator/total-pool", headers=_hdr(),
+                json={"total_pool_usd": 300000})
+    on_disk = json.loads(_total_pool_file(tmp_path).read_text())
+    assert on_disk["total_pool_usd"] == 300000.0
+    assert on_disk["source"] == "settings_edit"  # file already existed
+
+
+def test_total_pool_post_reallocate_deferred_on_subprocess_error(
+    client_with_fake_home, monkeypatch,
+):
+    # Brand-fresh box: scores absent → allocate subprocess errors. The
+    # SET must still 200 (reallocate:deferred), UI not blocked.
+    client, tmp_path = client_with_fake_home
+
+    def boom(args, **kw):
+        raise OSError("orchestrator venv missing on fresh box")
+
+    monkeypatch.setattr(orch_route.subprocess, "run", boom)
+    r = client.post("/api/v1/orchestrator/total-pool", headers=_hdr(),
+                     json={"total_pool_usd": 250000})
+    assert r.status_code == 200
+    assert r.json()["reallocate"] == "deferred"
+    # The set itself still persisted.
+    assert json.loads(_total_pool_file(tmp_path).read_text())[
+        "total_pool_usd"] == 250000.0
+
+
+def test_total_pool_post_reallocate_deferred_on_nonzero_rc(
+    client_with_fake_home, monkeypatch,
+):
+    client, _ = client_with_fake_home
+    monkeypatch.setattr(
+        orch_route.subprocess, "run",
+        lambda a, **k: subprocess.CompletedProcess(a, 3, stdout="", stderr="x"),
+    )
+    r = client.post("/api/v1/orchestrator/total-pool", headers=_hdr(),
+                     json={"total_pool_usd": 250000})
+    assert r.status_code == 200
+    assert r.json()["reallocate"] == "deferred"  # nonzero rc → deferred, still 200
+
+
+@pytest.mark.parametrize(
+    "bad,expect_msg_contains",
+    [
+        (500, "金额太小"),                    # < $1k
+        (0, "有效的美元金额"),                 # <= 0
+        (-100, "有效的美元金额"),              # negative
+        (2_000_000_000, "金额太大"),           # > $1B
+        (True, "有效的美元金额"),              # bool is NOT a valid number
+    ],
+)
+def test_total_pool_post_invalid_422_plain_language(
+    client_with_fake_home, bad, expect_msg_contains,
+):
+    client, tmp_path = client_with_fake_home
+    r = client.post("/api/v1/orchestrator/total-pool", headers=_hdr(),
+                     json={"total_pool_usd": bad})
+    assert r.status_code == 422
+    assert expect_msg_contains in r.json()["detail"]
+    # Invalid POST must NOT have written the file.
+    assert not _total_pool_file(tmp_path).exists()
+
+
+def test_total_pool_post_extra_field_forbidden_422(client_with_fake_home):
+    client, _ = client_with_fake_home
+    r = client.post("/api/v1/orchestrator/total-pool", headers=_hdr(),
+                     json={"total_pool_usd": 250000, "typo": 1})
+    assert r.status_code == 422  # extra='forbid'
+
+
+def test_total_pool_requires_auth(client_with_fake_home):
+    client, _ = client_with_fake_home
+    assert client.get("/api/v1/orchestrator/total-pool").status_code == 401
+    assert client.post("/api/v1/orchestrator/total-pool",
+                        json={"total_pool_usd": 1}).status_code == 401
+
+
+def test_total_pool_bounds_match_orchestrator_contract():
+    """Contract §4 drift guard: api-server's replicated bounds MUST
+    equal the orchestrator reader's single source of truth. If
+    nodeble_orchestrator is co-installed, assert equality directly;
+    else assert the documented constants (the contract doc + this
+    test are the cross-repo pin when the import isn't available)."""
+    assert orch_route.MIN_REASONABLE_POOL_USD == 1_000.0
+    assert orch_route.MAX_REASONABLE_POOL_USD == 1_000_000_000.0
+    try:
+        from nodeble_orchestrator import capital_pool  # type: ignore
+    except Exception:
+        pytest.skip(
+            "nodeble_orchestrator not co-installed (separate venv) — "
+            "bounds pinned via contract doc §4 + the literals above"
+        )
+    assert (
+        orch_route.MIN_REASONABLE_POOL_USD
+        == capital_pool.MIN_REASONABLE_POOL_USD
+    )
+    assert (
+        orch_route.MAX_REASONABLE_POOL_USD
+        == capital_pool.MAX_REASONABLE_POOL_USD
+    )
